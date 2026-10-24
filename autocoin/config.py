@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 
 
 @dataclass
 class Config:
-    serial: str = "100.112.173.34:38841"
+    serial: str = os.environ.get("AUTOCOIN_SERIAL", "")  # 未指定時僅接受唯一一台 ADB 裝置
     adb_host: str = "127.0.0.1"
     adb_port: int = 5037
 

@@ -49,7 +49,7 @@ def countdown(text: str) -> int | None:
     """「04:36」→ 276 秒。冒號偶爾會漏掉（「0115」）。"""
     t = clean(text)
     m = re.search(r"(\d{1,2}):(\d{2})", t) or re.fullmatch(r"(\d{2})(\d{2})", t)
-    return int(m[1]) * 60 + int(m[2]) if m else None
+    return int(m[1]) * 60 + int(m[2]) if m and int(m[2]) < 60 else None
 
 
 class Shot:
@@ -57,8 +57,15 @@ class Shot:
 
     def __init__(self, data: bytes):
         self.data = data
-        self.im = Image.open(io.BytesIO(data)).convert("RGB")
-        self.px = np.asarray(self.im).astype(np.int16)
+        with Image.open(io.BytesIO(data)) as image:
+            if image.size != (1125, 2436):
+                raise ValueError(f"Unsupported screenshot size {image.size}; layout requires 1125x2436")
+            self.im = image.convert("RGB")
+
+    @cached_property
+    def px(self):
+        # Color predicates only compare channels; uint8 halves the old int16 buffer.
+        return np.asarray(self.im)
 
     @cached_property
     def lines(self) -> list[Line]:
@@ -159,7 +166,7 @@ def read_room(s: Shot) -> Room:
     head = s.find("蝦皮直播", lines=s.box)
     top = watch or coin  # 標題在第一格正上方；有些直播間只有直播間蝦幣那一格
     banner = (head.x, head.y) if head else ((306, top.y - 24) if top else None)
-    done = s.find("成功領取")
+    done = s.find("成功領取", lines=[ln for ln in s.lines if ln.y < CHAT_TOP])
     return Room(
         anchor=s.name,
         watch=_task(s, watch),
@@ -215,6 +222,8 @@ class WithdrawPage:
 def read_withdraw(s: Shot) -> WithdrawPage:
     w = WithdrawPage()
     top, bottom = s.find("提領數值"), s.find("立即提領")
+    if top is None or bottom is None or top.y >= bottom.y:
+        return w
     if bottom:
         w.submit = (bottom.x, bottom.y)
     label = s.find("待提領蝦幣數")
@@ -224,6 +233,6 @@ def read_withdraw(s: Shot) -> WithdrawPage:
         if top and ln.y <= top.y or bottom and ln.y >= bottom.y or ln is label:
             continue
         m = re.search(r"(\d+)\.00$", clean(ln.text))
-        if m:
+        if m and int(m[1]) > 0:
             w.options.append((int(m[1]), (ln.x, ln.y)))
     return w

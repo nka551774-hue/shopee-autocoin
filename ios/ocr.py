@@ -6,21 +6,34 @@ from __future__ import annotations
 
 import asyncio
 import io
+import math
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, TYPE_CHECKING
 
 import numpy as np
 from PIL import Image
-from winrt.windows.globalization import Language
-from winrt.windows.graphics.imaging import BitmapPixelFormat, SoftwareBitmap
-from winrt.windows.media.ocr import OcrEngine
-from winrt.windows.storage.streams import DataWriter
+
+if TYPE_CHECKING:
+    from winrt.windows.graphics.imaging import SoftwareBitmap
 
 SCALE = 3  # 截圖像素 / iOS point
 
-_engine = OcrEngine.try_create_from_language(Language("zh-Hant-TW"))
-if _engine is None:
-    raise RuntimeError("找不到 zh-Hant-TW 的 OCR，請到 Windows 設定裝「中文(台灣)」語言的 OCR 元件")
+_engine = None
+
+
+def _get_engine():
+    """Only load Windows OCR when recognition is needed (status/help work offline)."""
+    global _engine
+    if _engine is None:
+        try:
+            from winrt.windows.globalization import Language
+            from winrt.windows.media.ocr import OcrEngine
+        except ImportError as exc:
+            raise RuntimeError("請先安裝 ios/requirements.txt 內的 Windows OCR 依賴") from exc
+        _engine = OcrEngine.try_create_from_language(Language("zh-Hant-TW"))
+        if _engine is None:
+            raise RuntimeError("找不到 zh-Hant-TW 的 OCR，請到 Windows 設定裝「中文(台灣)」語言的 OCR 元件")
+    return _engine
 
 
 @dataclass
@@ -39,29 +52,35 @@ class Line:
 
     @property
     def x(self) -> float:
-        return sum(w.x for w in self.words) / len(self.words)
+        return sum(w.x for w in self.words) / len(self.words) if self.words else 0.0
 
     @property
     def y(self) -> float:
-        return sum(w.y for w in self.words) / len(self.words)
+        return sum(w.y for w in self.words) / len(self.words) if self.words else 0.0
 
 
 def _bitmap(im: Image.Image) -> SoftwareBitmap:
-    im = im.convert("RGBA")
+    from winrt.windows.graphics.imaging import BitmapPixelFormat, SoftwareBitmap
+    from winrt.windows.storage.streams import DataWriter
+
     writer = DataWriter()
-    writer.write_bytes(im.tobytes("raw", "BGRA"))
-    return SoftwareBitmap.create_copy_from_buffer(
-        writer.detach_buffer(), BitmapPixelFormat.BGRA8, im.width, im.height)
+    try:
+        with im.convert("RGBA") as rgba:
+            writer.write_bytes(rgba.tobytes("raw", "BGRA"))
+        return SoftwareBitmap.create_copy_from_buffer(
+            writer.detach_buffer(), BitmapPixelFormat.BGRA8, im.width, im.height)
+    finally:
+        writer.close()
 
 
 async def _recognize(bitmap: SoftwareBitmap):
-    return await _engine.recognize_async(bitmap)
+    return await _get_engine().recognize_async(bitmap)
 
 
 def white_text(im: Image.Image) -> Image.Image:
     """只留白字、其他塗黑。直播間的任務框是半透明深色底，背後的畫面一直在動，
     原圖直接辨識常常漏字；這樣處理後連拍 16 張都讀得到（金額是黃字，會被濾掉）。"""
-    a = np.asarray(im.convert("RGB")).astype(np.int16)
+    a = np.asarray(im.convert("RGB"))
     lum, low = a.max(axis=2), a.min(axis=2)
     mask = (lum >= 185) & (lum - low < 90)
     return Image.fromarray(np.where(mask, 255, 0).astype(np.uint8)).convert("RGB")
@@ -72,7 +91,14 @@ def read(image: Image.Image | bytes, box: tuple[int, int, int, int] | None = Non
          ) -> list[Line]:
     """box 是 iOS point 的 (x1, y1, x2, y2)，只辨識那一塊（比較快也比較準）。
     prep 是辨識前的前處理（例如 white_text），在裁切後、放大前套用。"""
-    im = Image.open(io.BytesIO(image)) if isinstance(image, bytes) else image
+    if not math.isfinite(upscale) or upscale <= 0:
+        raise ValueError("upscale must be finite and positive")
+    _get_engine()
+    if isinstance(image, bytes):
+        with Image.open(io.BytesIO(image)) as source:
+            im = source.convert("RGB")
+    else:
+        im = image
     ox = oy = 0
     if box:
         x1, y1, x2, y2 = (int(v * SCALE) for v in box)
@@ -82,7 +108,11 @@ def read(image: Image.Image | bytes, box: tuple[int, int, int, int] | None = Non
         im = prep(im)
     if upscale != 1.0:
         im = im.resize((int(im.width * upscale), int(im.height * upscale)), Image.LANCZOS)
-    result = asyncio.run(_recognize(_bitmap(im)))
+    bitmap = _bitmap(im)
+    try:
+        result = asyncio.run(_recognize(bitmap))
+    finally:
+        bitmap.close()
     lines = []
     for line in result.lines:
         words = []

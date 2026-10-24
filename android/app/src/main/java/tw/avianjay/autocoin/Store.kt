@@ -3,6 +3,9 @@ package tw.avianjay.autocoin
 import android.content.Context
 import org.json.JSONObject
 import java.time.LocalDate
+import java.time.ZoneId
+
+val REWARD_ZONE: ZoneId = ZoneId.of("Asia/Taipei")
 
 /** 使用者可以調的設定。 */
 class Settings(ctx: Context) {
@@ -45,6 +48,7 @@ class Day(val date: String) {
     var watchDone = false
     var withdrawals = 0
     var withdrawn = 0.0
+    var withdrawalUncertain = false
     var pending = 0.0
     var lastPanel = 0L
     var finalPanel = false
@@ -60,6 +64,7 @@ class Day(val date: String) {
         put("wheelSpins", wheelSpins); put("wheelTotal", wheelTotal); put("wheelDone", wheelDone)
         put("watchTotal", watchTotal); put("watchMinutes", watchMinutes); put("watchDone", watchDone)
         put("withdrawals", withdrawals); put("withdrawn", withdrawn); put("pending", pending)
+        put("withdrawalUncertain", withdrawalUncertain)
         put("lastPanel", lastPanel); put("finalPanel", finalPanel)
         put("rooms", JSONObject().apply {
             for ((k, r) in rooms) put(k, JSONObject().apply {
@@ -70,53 +75,107 @@ class Day(val date: String) {
     }
 
     companion object {
-        fun fromJson(o: JSONObject) = Day(o.getString("date")).apply {
-            coinClaims = o.optInt("coinClaims"); coinTotal = o.optDouble("coinTotal", 0.0)
-            coinLimitHit = o.optBoolean("coinLimitHit")
-            wheelSpins = o.optInt("wheelSpins"); wheelTotal = o.optDouble("wheelTotal", 0.0)
-            wheelDone = o.optBoolean("wheelDone")
-            watchTotal = o.optDouble("watchTotal", 0.0); watchMinutes = o.optInt("watchMinutes")
-            watchDone = o.optBoolean("watchDone")
-            withdrawals = o.optInt("withdrawals"); withdrawn = o.optDouble("withdrawn", 0.0)
-            pending = o.optDouble("pending", 0.0)
-            lastPanel = o.optLong("lastPanel"); finalPanel = o.optBoolean("finalPanel")
-            val rs = o.optJSONObject("rooms") ?: JSONObject()
+        private fun amount(o: JSONObject, key: String): Double {
+            if (!o.has(key)) return 0.0
+            val raw = o.get(key)
+            require(raw is Number) { "$key 金額格式無效" }
+            return raw.toDouble().also { require(it.isFinite() && it >= 0) { "$key 金額無效" } }
+        }
+
+        private fun count(o: JSONObject, key: String): Int {
+            val value = amount(o, key)
+            require(value <= Int.MAX_VALUE && value % 1.0 == 0.0) { "$key 次數無效" }
+            return value.toInt()
+        }
+
+        private fun flag(o: JSONObject, key: String): Boolean {
+            if (!o.has(key)) return false
+            val raw = o.get(key)
+            require(raw is Boolean) { "$key 旗標格式無效" }
+            return raw
+        }
+
+        private fun timestamp(o: JSONObject, key: String): Long {
+            if (!o.has(key)) return 0
+            val raw = o.get(key)
+            require(raw is Number) { "$key 時間格式無效" }
+            val value = raw.toString().toLongOrNull()
+            require(value != null && value >= 0) { "$key 時間無效" }
+            return value
+        }
+
+        fun fromJson(o: JSONObject) = Day(LocalDate.parse(o.getString("date")).toString()).apply {
+            coinClaims = count(o, "coinClaims"); coinTotal = amount(o, "coinTotal")
+            coinLimitHit = flag(o, "coinLimitHit")
+            wheelSpins = count(o, "wheelSpins"); wheelTotal = amount(o, "wheelTotal")
+            wheelDone = flag(o, "wheelDone")
+            watchTotal = amount(o, "watchTotal"); watchMinutes = count(o, "watchMinutes")
+            watchDone = flag(o, "watchDone")
+            withdrawals = count(o, "withdrawals"); withdrawn = amount(o, "withdrawn")
+            withdrawalUncertain = flag(o, "withdrawalUncertain")
+            pending = amount(o, "pending")
+            lastPanel = timestamp(o, "lastPanel"); finalPanel = flag(o, "finalPanel")
+            val rs = if (o.has("rooms")) o.getJSONObject("rooms") else JSONObject()
             for (k in rs.keys()) {
                 val r = rs.getJSONObject(k)
                 rooms[k] = RoomStat().apply {
-                    claims = r.optInt("claims"); coins = r.optDouble("coins", 0.0); done = r.optBoolean("done")
-                    wheel = r.optBoolean("wheel"); wheelGot = r.optBoolean("wheelGot")
-                    watched = r.optBoolean("watched")
+                    claims = count(r, "claims"); coins = amount(r, "coins"); done = flag(r, "done")
+                    wheel = flag(r, "wheel"); wheelGot = flag(r, "wheelGot")
+                    watched = flag(r, "watched")
                 }
             }
+            require(lastPanel >= 0) { "面板時間無效" }
         }
     }
 }
 
-class Store(ctx: Context) {
+class Store(ctx: Context, private val dateProvider: () -> LocalDate = { LocalDate.now(REWARD_ZONE) }) {
     private val prefs = ctx.getSharedPreferences("state", Context.MODE_PRIVATE)
+    private var failure: String? = null
     private var current: Day = load()
 
-    private fun today() = LocalDate.now().toString()
+    private fun today() = dateProvider().toString()
 
-    private fun load(): Day {
-        val raw = prefs.getString("day", null)
-        val day = try {
-            raw?.let { Day.fromJson(JSONObject(it)) }
-        } catch (e: Exception) {
-            AppLog.w("讀取統計失敗，從頭開始：$e")
-            null
-        }
-        return if (day != null && day.date == today()) day else Day(today())
+    private fun nextDay(previous: Day, date: String) = Day(date).apply {
+        // A transaction with an unknown outcome is not resolved by midnight or a restart.
+        withdrawalUncertain = previous.withdrawalUncertain
+        pending = previous.pending
     }
 
-    /** 換日時自動重來。 */
+    private fun load(): Day {
+        val date = today()
+        val loaded = try {
+            prefs.getString("day", null)?.let { Day.fromJson(JSONObject(it)) } ?: return Day(date)
+        } catch (e: Exception) {
+            failure = "統計資料無效，已停止所有自動操作；請先修復原始資料"
+            AppLog.e(failure!!, e)
+            // This placeholder is only for rendering the error. day/save must reject it.
+            return Day(date)
+        }
+        if (loaded.date > date) {
+            failure = "系統日期早於已儲存的統計日期 ${loaded.date}，已停止；請修正日期後重新開始"
+            return loaded
+        }
+        return if (loaded.date == date) loaded else nextDay(loaded, date)
+    }
+
+    @Synchronized
+    fun requireReady() {
+        if (failure == null && current.date > today()) {
+            failure = "系統日期倒退，已停止並保留原有配額；請修正日期後重新開始"
+        }
+        failure?.let { throw StopBot(it) }
+    }
+
+    /** Only move forwards; unresolved transactions remain blocked across days. */
     @get:Synchronized
     val day: Day
         get() {
-            if (current.date != today()) {
+            requireReady()
+            val date = today()
+            if (current.date < date) {
                 AppLog.i("換日了：${summary()}")
-                current = Day(today())
+                current = nextDay(current, date)
                 save()
             }
             return current
@@ -124,12 +183,18 @@ class Store(ctx: Context) {
 
     @Synchronized
     fun save() {
-        prefs.edit().putString("day", current.toJson().toString()).apply()
+        requireReady()
+        // Persist transaction markers before tapping; apply() can lose them on process death.
+        if (!prefs.edit().putString("day", current.toJson().toString()).commit()) {
+            throw StopBot("統計無法儲存，停止以免重複操作")
+        }
     }
 
     fun summary(): String {
+        failure?.let { return "已停止：$it（原始資料未覆寫）" }
         val d = current
+        val notice = if (d.withdrawalUncertain) "｜提領結果待核對（自動提領已鎖定）" else ""
         return "${d.date} 直播間蝦幣 ${d.coinClaims} 次 +%.2f｜轉盤 ${d.wheelSpins} 次 +%.2f｜觀看任務 ${d.watchMinutes} 分鐘 +%.2f｜提領 ${d.withdrawals}/3 次 %.0f｜待提領 %.2f"
-            .format(d.coinTotal, d.wheelTotal, d.watchTotal, d.withdrawn, d.pending)
+            .format(d.coinTotal, d.wheelTotal, d.watchTotal, d.withdrawn, d.pending) + notice
     }
 }

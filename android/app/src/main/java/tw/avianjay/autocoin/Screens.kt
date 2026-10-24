@@ -6,10 +6,15 @@ private val TIME = Regex("""(\d+):(\d{2})""")
 private val NUM = Regex("""\d+(?:\.\d+)?""")
 private val PURE_NUM = Regex("""\d+(?:\.\d+)?""")
 
-fun num(text: String?): Double? = text?.let { NUM.find(it)?.value?.toDouble() }
+fun num(text: String?): Double? = text?.let { NUM.find(it)?.value?.toDoubleOrNull()?.takeIf(Double::isFinite) }
 
-fun countdown(state: String): Int? =
-    TIME.matchEntire(state.trim())?.let { it.groupValues[1].toInt() * 60 + it.groupValues[2].toInt() }
+fun countdown(state: String): Int? {
+    val match = TIME.matchEntire(state.trim()) ?: return null
+    val minutes = match.groupValues[1].toLongOrNull() ?: return null
+    val seconds = match.groupValues[2].toIntOrNull() ?: return null
+    if (seconds !in 0..59 || minutes > (Int.MAX_VALUE - seconds) / 60L) return null
+    return (minutes * 60 + seconds).toInt()
+}
 
 enum class Screen(val label: String) {
     ROOM("直播間"),
@@ -152,7 +157,8 @@ fun numberNear(s: Snap, anchor: N, below: Boolean): Double? {
         val b = n.bounds
         if (b.right < a.left - 200 || b.left > a.right + 200) continue
         val gap = if (below) b.top - a.bottom else a.top - b.bottom
-        if (gap in -20..150 && (best == null || gap < best.first)) best = gap to n.text.toDouble()
+        val value = num(n.text) ?: continue
+        if (gap in -20..150 && (best == null || gap < best.first)) best = gap to value
     }
     return best?.second
 }

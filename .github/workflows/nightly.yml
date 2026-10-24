@@ -15,21 +15,51 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  checks:
+    uses: ./.github/workflows/checks.yml
+
+  signing:
+    needs: checks
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    outputs:
+      ready: ${{ steps.configuration.outputs.ready }}
+    steps:
+      - name: Check signing configuration
+        id: configuration
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_ALIAS: ${{ secrets.KEYSTORE_ALIAS }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -n "$KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_ALIAS" ] && [ -n "$KEYSTORE_PASSWORD" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Signing secrets are not configured; checks passed, signed release skipped."
+          fi
+
   android:
     name: Build signed release APK
+    needs: signing
+    if: github.ref == 'refs/heads/main' && needs.signing.outputs.ready == 'true'
     # 釘住 runner 版本：ubuntu-latest 在 2026-10-19 會換成 Ubuntu 26，
     # 夜間建置不該因為 image 換版而默默壞掉。
     runs-on: ubuntu-24.04
     timeout-minutes: 40
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v6
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
         with:
           distribution: temurin
           java-version: "21"
@@ -40,17 +70,14 @@ jobs:
         run: |
           set -euo pipefail
           SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
-          MGR="$(find "$SDK/cmdline-tools" -type f -name sdkmanager 2>/dev/null | head -n1 || true)"
+          MGR="$SDK/cmdline-tools/latest/bin/sdkmanager"
           echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
-          echo "sdkmanager: ${MGR:-<找不到，交給 Gradle 自動下載>}"
-          if [ -n "$MGR" ]; then
-            yes | "$MGR" --licenses > /dev/null 2>&1 || true
-            "$MGR" --install "platforms;android-36" "platform-tools" > /dev/null 2>&1 || true
-          fi
-          ls "$SDK/platforms" 2>/dev/null || true
+          test -x "$MGR"
+          # Runner 的 SDK licenses 已接受；安裝失敗必須阻止發布。
+          "$MGR" --install "platforms;android-36" "build-tools;36.0.0" "platform-tools"
 
       - name: Cache Gradle
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.gradle/caches
@@ -64,6 +91,7 @@ jobs:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
         run: |
           set -euo pipefail
+          umask 077
           if [ -z "${KEYSTORE_BASE64:-}" ]; then
             echo "::error::repo secret KEYSTORE_BASE64 沒有設定（base64 後的 .jks 內容）"
             exit 1
@@ -89,48 +117,54 @@ jobs:
           chmod +x gradlew
           ./gradlew --no-daemon --stacktrace assembleRelease
 
+      - name: Remove signing key
+        if: always()
+        run: rm -f -- "$RUNNER_TEMP/ks/release.jks"
+
       - name: Collect artifact
         id: apk
         run: |
           set -euo pipefail
-          src=$(find android/app/build/outputs/apk/release -name '*.apk' | head -n1)
-          [ -n "$src" ] || { echo "::error::找不到 APK"; exit 1; }
+          src=android/app/build/outputs/apk/release/app-release.apk
+          test -s "$src"
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose "$src"
           # 固定檔名，這樣每次都會覆蓋掉上一個，release 裡只留最新的一份
           cp "$src" autocoin-nightly.apk
           sha256sum autocoin-nightly.apk | tee autocoin-nightly.apk.sha256
           echo "sha=$(cut -d' ' -f1 autocoin-nightly.apk.sha256)" >> "$GITHUB_OUTPUT"
 
-      - name: Point nightly tag at this commit
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set +e
-          repo="${{ github.repository }}"
-          sha="${{ github.sha }}"
-          if gh api "repos/$repo/git/ref/tags/nightly" > /dev/null 2>&1; then
-            gh api -X PATCH "repos/$repo/git/refs/tags/nightly" -F sha="$sha" -F force=true > /dev/null
-          else
-            gh api -X POST "repos/$repo/git/refs" -f ref="refs/tags/nightly" -f sha="$sha" > /dev/null
-          fi
-          exit 0
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: signed-nightly
+          retention-days: 3
+          if-no-files-found: error
+          path: |
+            autocoin-nightly.apk
+            autocoin-nightly.apk.sha256
 
-      - name: Clear old nightly assets
-        env:
-          GH_TOKEN: ${{ github.token }}
+  publish:
+    needs: android
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: signed-nightly
+      - name: Verify artifact
+        id: apk
         run: |
-          set +e
-          if gh release view nightly > /dev/null 2>&1; then
-            gh release view nightly --json assets --jq '.assets[].name' |
-              while read -r a; do
-                [ -n "$a" ] && gh release delete-asset nightly "$a" --yes > /dev/null 2>&1
-              done
-          fi
-          exit 0
+          set -euo pipefail
+          sha256sum --check autocoin-nightly.apk.sha256
+          echo "sha=$(cut -d' ' -f1 autocoin-nightly.apk.sha256)" >> "$GITHUB_OUTPUT"
 
       - name: Update nightly release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@5113cdc90fd4d541c801c55356214017bf5ae34b # v3
         with:
           tag_name: nightly
+          target_commitish: ${{ github.sha }}
           name: Nightly · build ${{ github.run_number }}
           prerelease: true
           fail_on_unmatched_files: true
@@ -145,3 +179,14 @@ jobs:
           files: |
             autocoin-nightly.apk
             autocoin-nightly.apk.sha256
+
+      - name: Point nightly tag at verified commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          gh api -X PATCH "repos/$GH_REPO/git/refs/tags/nightly" -f sha="$RELEASE_SHA" -F force=true > /dev/null
+          actual=$(gh api "repos/$GH_REPO/git/ref/tags/nightly" --jq '.object.sha')
+          test "$actual" = "$RELEASE_SHA"

@@ -11,6 +11,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Switch
 import android.widget.TextView
+import java.time.LocalDate
 
 /** 主畫面：開無障礙設定、開始／停止、自動提領開關、今天的統計和紀錄。 */
 class MainActivity : Activity() {
@@ -19,6 +20,9 @@ class MainActivity : Activity() {
     private lateinit var startStop: Button
     private lateinit var summary: TextView
     private lateinit var logView: TextView
+    private var lastState: String? = null
+    private var lastStateDate = ""
+    private var lastLogVersion = -1L
 
     private val tick = object : Runnable {
         override fun run() {
@@ -95,7 +99,17 @@ class MainActivity : Activity() {
         else "無障礙服務：已開啟｜${svc.statusText}"
         startStop.isEnabled = svc != null
         startStop.text = if (svc?.running == true) "停止" else "開始"
-        summary.text = Store(this).summary().replace("｜", "\n")
-        logView.text = AppLog.recent(150).asReversed().joinToString("\n")
+        val raw = getSharedPreferences("state", MODE_PRIVATE).getString("day", null)
+        val today = LocalDate.now(REWARD_ZONE).toString()
+        if (raw != lastState || today != lastStateDate) {
+            summary.text = Store(this).summary().replace("｜", "\n")
+            lastState = raw
+            lastStateDate = today
+        }
+        val logVersion = AppLog.version
+        if (logVersion != lastLogVersion) {
+            logView.text = AppLog.recent(150).asReversed().joinToString("\n")
+            lastLogVersion = logVersion
+        }
     }
 }

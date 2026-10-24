@@ -17,11 +17,12 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import re
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import timedelta
 from difflib import SequenceMatcher
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -30,7 +31,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from autocoin.config import Config  # noqa: E402
-from autocoin.state import Store  # noqa: E402
+from autocoin.state import StateError, Store, reward_now  # noqa: E402
+from ocr import _get_engine  # noqa: E402
 from screens import (BACK, Panel, Room, Screen, Shot, detect, money, read_panel,  # noqa: E402
                      read_room, read_withdraw)
 from tsclient import TouchSynthesis  # noqa: E402
@@ -81,35 +83,57 @@ class Phone:
     def __init__(self, host: str):
         self.host = host
         self.ts: TouchSynthesis | None = None
+        self.deadline: float | None = None
 
-    def _call(self, fn):
+    def _call(self, fn, *, retry: bool = True):
         since = None
         while True:
+            if self.deadline is not None and time.monotonic() >= self.deadline:
+                raise StopBot("設定的執行時間已到")
+            started = False
             try:
                 if self.ts is None:
-                    self.ts = TouchSynthesis(self.host, timeout=40)
+                    timeout = (min(40, max(.01, self.deadline - time.monotonic()))
+                               if self.deadline is not None else 40)
+                    self.ts = TouchSynthesis(self.host, timeout=timeout)
                     if since:
                         log.info("TouchSynthesis 連上了")
+                started = True
+                if self.deadline is not None:
+                    remaining = self.deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise StopBot("設定的執行時間已到")
+                    self.ts.timeout = min(40, remaining)
                 return fn(self.ts)
             except OSError as e:  # 連線被拒、逾時、斷線（ConnectionError 也是 OSError）
                 if self.ts:
                     self.ts.close()
                     self.ts = None
+                if started and not retry:
+                    raise StopBot("觸控指令的回覆遺失，結果不明，停止以避免重複操作") from e
                 if since is None:
-                    since = time.time()
+                    since = time.monotonic()
                     log.warning("連不到 TouchSynthesis（%s）：手機上的 App 還開著嗎？Server 有啟動嗎？", e)
-                if time.time() - since > self.GIVE_UP:
+                if time.monotonic() - since > self.GIVE_UP:
                     raise StopBot("TouchSynthesis 一直連不上") from e
-                time.sleep(10)
+                time.sleep(min(10, max(0, self.deadline - time.monotonic()))
+                           if self.deadline is not None else 10)
+            except (RuntimeError, ValueError) as e:
+                self.close()
+                raise StopBot(f"TouchSynthesis 回覆無效或操作失敗：{e}") from e
 
     def shot(self) -> Shot:
-        return Shot(self._call(lambda ts: ts.screenshot()))
+        data = self._call(lambda ts: ts.screenshot())
+        try:
+            return Shot(data)
+        except (OSError, ValueError) as exc:
+            raise StopBot(f"截圖無法安全判讀：{exc}") from exc
 
     def tap(self, x: float, y: float):
-        self._call(lambda ts: ts.tap(x, y))
+        self._call(lambda ts: ts.tap(x, y), retry=False)
 
     def swipe(self, x1: float, y1: float, x2: float, y2: float, duration: float = 0.4):
-        self._call(lambda ts: ts.swipe(x1, y1, x2, y2, duration))
+        self._call(lambda ts: ts.swipe(x1, y1, x2, y2, duration), retry=False)
 
     def close(self):
         if self.ts:
@@ -132,28 +156,47 @@ class Bot:
         return self.store.day
 
     # ---------------- 基本工具 ----------------
-    def look(self) -> tuple[Screen, Shot]:
+    def ensure_running(self):
+        if self.time_up():
+            raise StopBot("設定的執行時間已到")
+
+    def pause(self, seconds: float):
+        self.ensure_running()
+        if self.end is not None:
+            seconds = min(seconds, max(0, self.end - time.monotonic()))
+        time.sleep(seconds)
+        self.ensure_running()
+
+    def snapshot(self) -> Shot:
+        self.ensure_running()
         s = self.phone.shot()
+        self.check_risk(s)
+        return s
+
+    def look(self) -> tuple[Screen, Shot]:
+        s = self.snapshot()
+        scr = detect(s)
         # 系統的評分邀請（「喜歡「蝦皮購物」嗎？」）會蓋住整個畫面，提領完就跳出來過
         later = next((ln for ln in s.lines if ln.text in POPUP_DISMISS), None)
-        if later:
+        if later and scr is not Screen.UNKNOWN:
             log.info("關掉彈出視窗（%s）", later.text)
             self.phone.tap(later.x, later.y)
-            time.sleep(1.5)
-            s = self.phone.shot()
+            self.pause(1.5)
+            s = self.snapshot()
         return detect(s), s
 
     def wait_for(self, wanted: set[Screen], timeout: float = 10) -> tuple[Screen, Shot]:
-        deadline = time.time() + timeout
+        deadline = time.monotonic() + timeout
         while True:
             scr, s = self.look()
-            if scr in wanted or time.time() >= deadline:
+            if scr in wanted or time.monotonic() >= deadline:
                 return scr, s
-            time.sleep(0.7)
+            self.pause(0.7)
 
     def capture(self, tag: str, s: Shot | None = None):
         """存下目前畫面（截圖＋OCR 文字），之後分析沒看過的狀態用。"""
-        base = self.captures / f"{datetime.now():%m%d-%H%M%S}-{re.sub(r'[^\w.-]+', '_', tag)}"
+        safe_tag = re.sub(r"[^\w.-]+", "_", tag)
+        base = self.captures / f"{reward_now():%Y%m%d-%H%M%S-%f}-{safe_tag}"
         try:
             s = s or self.phone.shot()
             Path(f"{base}.jpg").write_bytes(s.data)
@@ -178,9 +221,7 @@ class Bot:
         def hit(keys):
             return next((t for t in texts if any(k in t for k in keys)), None)
 
-        if t := hit(MSG_RISK):
-            self.capture("risk", s)
-            raise StopBot(f"蝦皮回報「{t}」，為了帳號安全先停止")
+        self.check_risk(s)
         if t := hit(MSG_DAILY_LIMIT):
             if not self.day.coin_limit_hit:
                 log.info("直播間蝦幣今天的次數用完了（%s）", t)
@@ -190,6 +231,12 @@ class Bot:
         if hit(MSG_ROOM_DONE):
             return "room_done"
         return ""
+
+    def check_risk(self, s: Shot):
+        text = next((t for t in s.texts() if any(k in t for k in MSG_RISK)), None)
+        if text:
+            self.capture("risk", s)
+            raise StopBot(f"蝦皮回報「{text}」，為了帳號安全先停止")
 
     def known(self, name: str) -> str:
         """對到今天已經記錄過的直播間就沿用原本的名字。"""
@@ -202,8 +249,8 @@ class Bot:
     def back_to_room(self, scr: Screen, s: Shot) -> bool:
         """收掉蓋在直播間上面的頁面（面板、提領頁）。回不到直播間就回傳 False。
 
-        認不得的畫面先多看幾眼（OCR 偶爾整頁漏讀），還是認不得才按一次返回；
-        只按一次是因為不知道畫面上是什麼，可能是蝦皮被關掉、或有人在用手機。"""
+        認不得的畫面先多看幾眼（OCR 偶爾整頁漏讀）；仍無法辨識時停止導航，
+        因為畫面可能已經切換至其他 App。"""
         unknown = 0
         for _ in range(6):
             if scr is Screen.ROOM:
@@ -212,12 +259,10 @@ class Bot:
                 self.phone.tap(*BACK)
             else:
                 unknown += 1
-                if unknown == 3:
+                if unknown >= 3:
                     self.capture("unknown", s)
-                    self.phone.tap(*BACK)
-                elif unknown > 3:
                     return False
-            time.sleep(2)
+            self.pause(2)
             scr, s = self.look()
         return scr is Screen.ROOM
 
@@ -227,11 +272,11 @@ class Bot:
         if scr is Screen.ROOM:
             return s
         if self.back_to_room(scr, s):
-            return self.phone.shot()
+            return self.snapshot()
         log.warning("回不到直播間（畫面已存檔）。不會亂點，請把手機切回蝦皮的「直播」分頁…")
         self.capture("lost", s)
         while not self.time_up():
-            time.sleep(20)
+            self.pause(20)
             scr, s = self.look()
             if scr is Screen.ROOM:
                 log.info("回到直播間，繼續")
@@ -244,7 +289,7 @@ class Bot:
         """讀目前這間。任務框常常晚一點才出來（或閃一下不見），沒看到直播間蝦幣就再看一次。"""
         r = read_room(self.go_room())
         if not r.coin.present or not r.key:
-            time.sleep(2)
+            self.pause(2)
             again = read_room(self.go_room())
             if again.coin.present or not r.key:
                 r = again
@@ -252,7 +297,7 @@ class Bot:
 
     def next_room(self):
         self.phone.swipe(*SWIPE_NEXT)
-        time.sleep(3)
+        self.pause(3)
 
     def find_room(self) -> tuple[str, str]:
         """從目前這間開始往上滑，找今天還沒處理過、有直播間蝦幣的直播間；回傳（目的, 直播主）。
@@ -285,9 +330,9 @@ class Bot:
     def stay(self, purpose: str, key: str) -> tuple[str, str]:
         """待在目前的直播間直到該走了。purpose：coins / watch。回傳（原因, 直播主）。"""
         cfg = self.cfg
-        start = time.time()
+        start = time.monotonic()
         coin_missing = odd_state = watch_stuck = None
-        watch_last, watch_since = None, time.time()
+        watch_last, watch_since = None, time.monotonic()
         while True:
             scr, s = self.look()
             if scr is not Screen.ROOM:
@@ -307,12 +352,12 @@ class Bot:
             # 觀看任務：每間只算 10 分鐘，算滿之後倒數會停住不動
             secs = r.watch.seconds
             if secs != watch_last:
-                watch_last, watch_since = secs, time.time()
-            watch_full = secs is not None and time.time() - watch_since > WATCH_FROZEN
+                watch_last, watch_since = secs, time.monotonic()
+            watch_full = secs is not None and time.monotonic() - watch_since > WATCH_FROZEN
             # 到點會自己領，卡在「領取」太久才幫忙按
             if r.watch.claimable:
-                watch_stuck = watch_stuck or time.time()
-                if time.time() - watch_stuck > 15:
+                watch_stuck = watch_stuck or time.monotonic()
+                if time.monotonic() - watch_stuck > 15:
                     self.phone.tap(*r.watch.button)
                     watch_stuck = None
             else:
@@ -322,7 +367,7 @@ class Bot:
                 self.panel_tasks()
                 continue
 
-            elapsed = time.time() - start
+            elapsed = time.monotonic() - start
             if elapsed > cfg.max_room_minutes * 60:
                 return "timeout", key
             if purpose == "watch":
@@ -332,42 +377,46 @@ class Bot:
                     continue
                 if watch_full or elapsed > cfg.watch_room_minutes * 60:
                     return "watched", key
-                time.sleep(20)
+                self.pause(20)
                 continue
 
             # 直播間蝦幣
             if not r.coin.present:
-                coin_missing = coin_missing or time.time()
-                if time.time() - coin_missing > cfg.no_coin_grace:
+                coin_missing = coin_missing or time.monotonic()
+                if time.monotonic() - coin_missing > cfg.no_coin_grace:
                     return "no_coins", key
-                time.sleep(3)
+                self.pause(3)
                 continue
             coin_missing = None
             if r.coin.claimable:
                 if "成功" in r.claimed:  # 上一次的成功提示還在，按鈕還沒換掉
-                    time.sleep(1)
+                    self.pause(1)
                 else:
                     self.claim(r, key)
                 continue
             secs = r.coin.seconds
             if secs is None:  # 剛領完的空檔、或 OCR 沒讀到
-                odd_state = odd_state or time.time()
-                if time.time() - odd_state > 45:
+                odd_state = odd_state or time.monotonic()
+                if time.monotonic() - odd_state > 45:
                     self.capture(f"coin-{r.coin.state or 'blank'}", s)
                     return f"coin_state:{r.coin.state or '?'}", key
-                time.sleep(2)
+                self.pause(2)
                 continue
             odd_state = None
-            time.sleep(min(max(secs - 3, 1), 20))
+            self.pause(min(max(secs - 3, 1), 20))
 
     def claim(self, r: Room, key: str):
         """按「直播間蝦幣」的領取，確認有成功。"""
+        self.ensure_running()
+        if (not r.coin.claimable or r.coin.button is None or r.claimed
+                or self.day.coin_limit_hit or self.day.coin_claims >= 100):
+            return
         self.phone.tap(*r.coin.button)
         amount = None
-        deadline = time.time() + 6
+        deadline = time.monotonic() + 6
         s = None
-        while time.time() < deadline:
-            s = self.phone.shot()
+        while time.monotonic() < deadline:
+            s = self.snapshot()
             got = read_room(s).claimed
             if "成功" in got:
                 amount = money(got)
@@ -379,22 +428,17 @@ class Bot:
             if verdict:
                 log.info("領取沒成功：%s", REASONS.get(verdict, verdict))
                 return
+            self.pause(0.25)
         if amount is None:
-            # 沒看到成功提示：倒數已經重新開始的話也算成功（金額不明）
-            after = read_room(s).coin if s else None
-            if after and (after.seconds or 0) > 120:
-                amount = 0.0
-                log.warning("沒看到成功提示，但倒數重新開始了，當作有領到")
-            else:
-                log.warning("直播間蝦幣按了沒反應（現在顯示：%s）",
-                            (after.state if after and after.present else "不見了") or "?")
-                self.capture("claim-unknown", s)
-                return
+            self.capture("claim-unknown", s)
+            raise StopBot("直播間領取結果不明，停止以避免重複操作；未計入成功")
         day = self.day
         room = day.room(key)
         room["claims"] += 1
         room["coins"] = round(room["coins"] + amount, 2)
         day.coin_claims += 1
+        if day.coin_claims >= 100:
+            day.coin_limit_hit = True
         day.coin_total = round(day.coin_total + amount, 2)
         self.store.save()
         log.info("✔ 直播間蝦幣 +%.2f｜%s 第 %d 次｜今天 %d 次，共 %.2f",
@@ -402,8 +446,8 @@ class Bot:
         # 成功提示出來後按鈕還會停在「領取」4 秒左右；等它換掉再走，免得又按一次
         # （那個位置按下去會打開任務獎勵面板）
         for _ in range(10):
-            time.sleep(0.8)
-            if not read_room(self.phone.shot()).coin.claimable:
+            self.pause(0.8)
+            if not read_room(self.snapshot()).coin.claimable:
                 break
 
     # ---------------- 任務獎勵面板 ----------------
@@ -412,8 +456,8 @@ class Bot:
         if time.time() - day.last_panel > self.cfg.panel_every_minutes * 60:
             return True
         # 觀看任務的蝦幣要當天領，23:40 再開一次
-        late = datetime.now().replace(hour=23, minute=40, second=0, microsecond=0)
-        return datetime.now() >= late and day.last_panel < late.timestamp()
+        late = reward_now().replace(hour=23, minute=40, second=0, microsecond=0)
+        return reward_now() >= late and day.last_panel < late.timestamp()
 
     def panel_tasks(self, final: bool = False):
         """開任務獎勵面板：把觀看任務的蝦幣領進待提領，需要時提領。
@@ -434,25 +478,32 @@ class Bot:
             self.capture("panel-not-open", s)
             self.back_to_room(scr, s)
             return
-        time.sleep(1.5)  # 等畫面載完
-        s = self.phone.shot()
+        self.pause(1.5)  # 等畫面載完
+        s = self.snapshot()
         p = read_panel(s)
         if p.claim:
             before = p.pending
+            previous_notice = s.find("已發放至")
             self.phone.tap(*p.claim)
-            time.sleep(1.5)
-            s = self.phone.shot()
+            self.pause(1.5)
+            s = self.snapshot()
             self.capture_once("panel-claimed", s)
+            notice = s.find("已發放至") if previous_notice is None else None
             # 領完會跳出「0.21 蝦幣已發放至您的"待提領蝦幣數"」，提示還在的時候按別的都沒反應
             for _ in range(8):
                 if not s.find("已發放至"):
                     break
-                time.sleep(1)
-                s = self.phone.shot()
+                self.pause(1)
+                s = self.snapshot()
             after = read_panel(s)
-            amount = p.claim_amount
-            if amount is None and before is not None and after.pending is not None:
-                amount = round(after.pending - before, 2)
+            increase = (round(after.pending - before, 2)
+                        if before is not None and after.pending is not None else None)
+            if not notice and (increase is None or increase <= 0):
+                self.capture("panel-claim-unknown", s)
+                raise StopBot("觀看任務領取結果不明；未計入成功，請檢查帳戶")
+            amount = increase if increase is not None and increase > 0 else money(notice.text)
+            if amount is None and notice:
+                amount = p.claim_amount
             day.watch_total = round(day.watch_total + (amount or 0.0), 2)
             log.info("✔ 觀看任務 +%s（領進待提領）", f"{amount:.2f}" if amount is not None else "?")
             p = after
@@ -465,20 +516,23 @@ class Bot:
             day.pending = p.pending
         self.store.save()
         log.info("待提領 %.2f｜觀看任務 %d/90 分鐘", day.pending, day.watch_minutes)
-        if self.should_withdraw(day.pending, final):
+        if p.pending is not None and self.should_withdraw(p.pending, final):
             self.withdraw(p)
         self.back_to_room(*self.look())
 
     def should_withdraw(self, pending: float, final: bool) -> bool:
         cfg, day = self.cfg, self.day
-        if not cfg.withdraw or day.withdrawals >= cfg.withdraw_daily_limit or pending < 1:
+        if (not cfg.withdraw or day.withdrawal_pending
+                or day.withdrawals >= cfg.withdraw_daily_limit or pending < 1):
             return False
-        late = datetime.now().hour == 23 and datetime.now().minute >= 40
+        late = reward_now().hour == 23 and reward_now().minute >= 40
         return pending >= cfg.withdraw_min or final or late
 
     def withdraw(self, p: Panel):
         """在面板按「提領」，選不超過待提領的最大面額，送出並確認待提領有變少。"""
         day = self.day
+        if day.withdrawal_pending:
+            raise StopBot("先前提領仍待確認，請核對帳戶後再啟用提領")
         if not p.withdraw:
             log.warning("面板上找不到「提領」")
             return
@@ -491,44 +545,51 @@ class Bot:
             log.warning("提領頁沒打開（目前在%s）", scr.value)
             self.capture("withdraw-not-open", s)
             return
-        time.sleep(1)
-        w = read_withdraw(self.phone.shot())
-        pending = w.pending if w.pending is not None else day.pending
-        options = [(a, pos) for a, pos in w.options if a <= pending]
+        self.pause(1)
+        w = read_withdraw(self.snapshot())
+        pending = w.pending
+        if pending is None:
+            raise StopBot("無法讀取目前待提領餘額，停止提領")
+        options = [(a, pos) for a, pos in w.options if 0 < a <= pending]
         if not options:
             log.info("待提領 %.2f，沒有能選的提領金額", pending)
             self.phone.tap(*BACK)
-            time.sleep(2)
+            self.pause(2)
             return
         amount, pos = max(options)
         self.phone.tap(*pos)
-        time.sleep(1)
-        s = self.phone.shot()
+        self.pause(1)
+        s = self.snapshot()
         w = read_withdraw(s)
         if not w.submit:
             log.warning("找不到「立即提領」")
             self.phone.tap(*BACK)
-            time.sleep(2)
+            self.pause(2)
             return
         self.capture_once("withdraw-selected", s)
+        day.withdrawal_pending = True
+        self.store.save()  # Journal before sending, including disconnect/interrupt outcomes.
         self.phone.tap(*w.submit)
+        confirmed = False
         for i in range(10):
-            time.sleep(1)
+            self.pause(1)
             scr, s = self.look()
             if i == 1:
                 self.capture_once("withdraw-submitted", s)
-            confirm = next((ln for ln in s.lines if ln.text in ("確認", "確定", "確認提領")), None)
-            if confirm:
+            confirm = next((ln for ln in s.lines if ln.text == "確認提領"), None)
+            if confirm and not confirmed and scr is Screen.WITHDRAW:
                 self.phone.tap(confirm.x, confirm.y)
+                confirmed = True
                 continue
             # 每天只能提領 3 次；手動提領過的話程式的計數會少算，看到上限提示就當作今天用完
             # （只看提領頁和面板，直播間的宣傳圖上常有「上限」之類的字）
-            limit = next((ln.text for ln in s.lines if scr is not Screen.ROOM and (
-                "上限" in ln.text or ("次" in ln.text and "已" in ln.text and "提領" in ln.text))),
-                None)
+            limit = next((ln.text for ln in s.lines
+                          if scr in (Screen.WITHDRAW, Screen.PANEL) and "提領" in ln.text
+                          and any(marker in ln.text for marker in ("已達", "已超過", "已用完", "不能再"))), None)
             if limit:
                 log.info("提領被拒：%s，今天不再提領", limit)
                 day.withdrawals = self.cfg.withdraw_daily_limit
+                day.withdrawal_pending = False
                 self.store.save()
                 break
             if scr is Screen.WITHDRAW:
@@ -539,10 +600,11 @@ class Bot:
                 after = None
             if s.find("提領成功") and after is None:
                 after = round(pending - amount, 2)
-            if after is not None and after <= pending - amount + 0.01:
+            if after is not None and abs(after - (pending - amount)) <= 0.01:
                 day.withdrawals += 1
-                day.withdrawn += amount
+                day.withdrawn = round(day.withdrawn + amount, 2)
                 day.pending = after
+                day.withdrawal_pending = False
                 self.store.save()
                 log.info("✔ 提領 %d 蝦幣到「我的蝦幣」（待提領剩 %.2f，今天第 %d 次）",
                          amount, after, day.withdrawals)
@@ -550,32 +612,30 @@ class Bot:
         else:
             log.warning("提領結果不明，畫面已存檔")
             self.capture("withdraw-unknown", s)
+            raise StopBot("提領結果不明，已保留待確認標記，停止以避免重複提領")
         if scr is Screen.WITHDRAW:
             self.phone.tap(*BACK)
-            time.sleep(2)
+            self.pause(2)
 
     # ---------------- 主迴圈 ----------------
     def run(self, hours: float | None = None):
-        self.end = time.time() + hours * 3600 if hours else None
+        if hours is not None and (not math.isfinite(hours) or hours <= 0):
+            raise ValueError("hours must be finite and positive")
+        self.end = time.monotonic() + hours * 3600 if hours is not None else None
+        self.phone.deadline = self.end
         log.info("開始：%s", self.store.summary())
         try:
             while not self.time_up():
                 try:
                     self.cycle()
-                except StopBot:
+                except (StopBot, StateError):
                     raise
                 except Exception:
                     log.exception("出錯了，10 秒後繼續")
-                    time.sleep(10)
+                    self.pause(10)
         except StopBot as e:
             log.error("停止：%s", e)
             return
-        # 正常結束前把觀看任務的蝦幣領掉（隔天就作廢了）
-        try:
-            self.go_room()
-            self.panel_tasks(final=True)
-        except Exception:
-            log.exception("收尾開面板失敗")
         log.info("結束：%s", self.store.summary())
 
     def cycle(self):
@@ -586,7 +646,7 @@ class Bot:
         purpose, key = self.find_room()
         if not purpose:
             log.info("滑了 %d 間都沒有合適的直播間，1 分鐘後繼續往下找", SCAN_ROOMS)
-            time.sleep(60)
+            self.pause(60)
             self.next_room()
             return
         reason, key = self.stay(purpose, key)
@@ -596,7 +656,7 @@ class Bot:
         day = self.day
         if key:
             room = day.room(key)
-            if purpose == "watch" or reason == "watched":
+            if reason == "watched":
                 room["watched"] = True
             if reason in DONE_REASONS or reason.startswith("coin_state"):
                 room["done"] = True
@@ -613,12 +673,12 @@ class Bot:
             day.final_panel = True
             self.store.save()
         log.info("今天能領的都領完了，休息到明天：%s", self.store.summary())
-        wake = (datetime.now() + timedelta(days=1)).replace(hour=0, minute=3, second=0, microsecond=0)
-        while datetime.now() < wake and not self.time_up():
-            time.sleep(min(300, max(1, (wake - datetime.now()).total_seconds())))
+        wake = (reward_now() + timedelta(days=1)).replace(hour=0, minute=3, second=0, microsecond=0)
+        while reward_now() < wake and not self.time_up():
+            self.pause(min(300, max(1, (wake - reward_now()).total_seconds())))
 
     def time_up(self) -> bool:
-        return self.end is not None and time.time() >= self.end
+        return self.end is not None and time.monotonic() >= self.end
 
 
 def setup_logging(log_dir: Path, verbose: bool):
@@ -650,6 +710,8 @@ def main():
     p.add_argument("--no-withdraw", action="store_true", help="不要自動提領")
     p.add_argument("-v", "--verbose", action="store_true", help="畫面上也顯示除錯訊息")
     args = p.parse_args()
+    if args.hours is not None and (not math.isfinite(args.hours) or args.hours <= 0):
+        p.error("--hours 必須是大於零的有限數值")
 
     sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
     cfg = Config()
@@ -659,37 +721,49 @@ def main():
     cfg.log_dir = str(ROOT / cfg.log_dir)
     setup_logging(Path(cfg.log_dir), args.verbose)
 
-    store = Store(cfg.state_path)
+    try:
+        store = Store(cfg.state_path)
+    except StateError as e:
+        p.exit(1, f"狀態檔錯誤：{e}\n")
     if args.command == "status":
         print(store.summary())
         return
 
-    phone = Phone(args.host)
-    bot = Bot(cfg, phone, store)
     try:
-        if args.command == "look":
-            scr, s = bot.look()
-            print(scr.value)
-            if scr is Screen.ROOM:
-                print(read_room(s))
-            elif scr is Screen.PANEL:
-                print(read_panel(s))
-            elif scr is Screen.WITHDRAW:
-                print(read_withdraw(s))
-            for ln in s.lines:
-                print(f"  ({ln.x:4.0f},{ln.y:4.0f}) {ln.text}")
-        elif args.command == "panel":
-            bot.go_room()
-            bot.panel_tasks()
-            print(store.summary())
-        else:
-            bot.run(args.hours)
-    except KeyboardInterrupt:
-        logging.getLogger("autocoin").info("手動停止：%s", store.summary())
-    except StopBot as e:
-        logging.getLogger("autocoin").error("停止：%s", e)
-    finally:
-        phone.close()
+        _get_engine()
+    except RuntimeError as exc:
+        p.exit(1, f"OCR 初始化失敗：{exc}\n")
+
+    try:
+        with store.exclusive():
+            phone = Phone(args.host)
+            bot = Bot(cfg, phone, store)
+            try:
+                if args.command == "look":
+                    scr, s = bot.look()
+                    print(scr.value)
+                    if scr is Screen.ROOM:
+                        print(read_room(s))
+                    elif scr is Screen.PANEL:
+                        print(read_panel(s))
+                    elif scr is Screen.WITHDRAW:
+                        print(read_withdraw(s))
+                    for ln in s.lines:
+                        print(f"  ({ln.x:4.0f},{ln.y:4.0f}) {ln.text}")
+                elif args.command == "panel":
+                    bot.go_room()
+                    bot.panel_tasks()
+                    print(store.summary())
+                else:
+                    bot.run(args.hours)
+            except KeyboardInterrupt:
+                logging.getLogger("autocoin").info("手動停止：%s", store.summary())
+            except StopBot as e:
+                logging.getLogger("autocoin").error("停止：%s", e)
+            finally:
+                phone.close()
+    except StateError as exc:
+        p.exit(1, f"State error: {exc}\n")
 
 
 if __name__ == "__main__":

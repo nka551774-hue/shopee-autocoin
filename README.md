@@ -7,15 +7,18 @@
 - **觀看直播任務**：定時開任務面板，把累積的蝦幣領進「待提領」。
 - **提領**（可關閉）：把「待提領」轉進「我的蝦幣」。
 
-有三個版本，邏輯相同：
+有四個版本，邏輯相同：
 
-| | 電腦版 | 手機版 | iOS 版 |
-|---|---|---|---|
-| 位置 | `autocoin/`（Python） | `android/`（Kotlin App「畫面輔助」） | `ios/`（Python） |
-| 怎麼控制手機 | ADB + uiautomator2 | 手機上的無障礙服務 | iPhone 上的 [TouchSynthesis](https://github.com/AnotherAvianJay/TouchSynthesis) + Windows OCR |
-| 需要電腦開著 | 要 | 不用 | 要 |
+| | 電腦版 | 手機版 | iOS 版 | iOS 越獄版 |
+|---|---|---|---|---|
+| 位置 | `autocoin/`（Python） | `android/`（Kotlin App「畫面輔助」） | `ios/`（Python） | `ios-jb/`（Python，跑在手機上） |
+| 怎麼控制手機 | ADB + uiautomator2 | 手機上的無障礙服務 | iPhone 上的 [TouchSynthesis](https://github.com/AnotherAvianJay/TouchSynthesis) + Windows OCR | iPhone 上的 ZXTouch（越獄，HID 觸控 + Vision OCR） |
+| 需要電腦開著 | 要 | 不用 | 要 | 不用 |
 
 研究過程與畫面元件的細節在 [RESEARCH.md](RESEARCH.md)。
+
+2026-10-25 的漏洞修正、效能量測、驗證方式及剩餘限制見 [AUDIT.md](AUDIT.md)。
+`ios-app/` 是尚未有完整建置專案的 Swift 原始碼，狀態見 [ios-app/README.md](ios-app/README.md)。
 
 ## 它會做什麼
 
@@ -49,11 +52,13 @@ python -m venv .venv
 .venv\Scripts\python -m autocoin panel          # 開一次任務面板（領觀看任務、視情況提領）
 ```
 
-- 裝置序號和 adb port 的預設值在 `autocoin/config.py`，也可以用 `--serial`、`--adb-port` 指定。程式固定連 5037，不受 `ANDROID_ADB_SERVER_PORT` 影響。
+- 以 `--serial` 或 `AUTOCOIN_SERIAL` 指定裝置；未指定時使用 `ANDROID_SERIAL` 或唯一一台 ADB 裝置，多台裝置會要求明確選擇。ADB server 預設連 5037，可用 `--adb-port` 覆蓋，不受 `ANDROID_ADB_SERVER_PORT` 影響。
 - 紀錄檔在 `logs/autocoin.log`，當天統計在 `state.json`。
 - 遇到沒看過的畫面，截圖和 UI 樹會存在 `logs/captures/`。
 - 執行中手機會被操作，**不要同時用手機**。
 - 建議開啟「充電時保持螢幕常亮」，避免鎖屏中斷。
+- `--hours` 必須是有限正數，時間到後停止操作，亦不會再觸發收尾提領；需要手動收尾可在確認畫面後使用 `panel`。
+- 同一份統計檔只允許一個操作程序。統計檔損壞會停止，不會把每日次數歸零。未確認的提領會記入 `withdrawal_pending`，重啟或跨日也不會自動再送；請依 [AUDIT.md](AUDIT.md) 核對後復原。
 
 ## 手機版（畫面輔助）
 
@@ -94,13 +99,31 @@ $env:TS_HOST = "192.168.31.196"                 # 手機的 IP
 - 沒有「看更多」列表，改成往上滑換台，找有「直播間蝦幣」的直播間。滑了 15 間都沒有的話，就在當下那間累積觀看任務。
 - 觀看任務的倒數停住 90 秒，就當作這間的 10 分鐘已經算滿。
 - 轉盤、紅包雨還沒做。
-- 開不了 App。畫面認不得時只按一次返回，之後就等你把手機切回蝦皮的直播間，不會亂點。
+- 開不了 App。畫面認不得時會等待你把手機切回蝦皮直播間；返回操作只用於已辨識的面板。
 - 等待與點擊沒有抖動。
 - 統計存在 `state-ios.json`（iOS 跟 Android 是不同的蝦皮帳號），紀錄檔在 `logs/ios.log`，沒看過的畫面存在 `logs/captures-ios/`。
+
+## iOS 越獄版（ios-jb/）
+
+越獄（Dopamine 16.1.1 測過）之後，觸控與 OCR 都交給手機上的 ZXTouch，**完全不用電腦**：
+
+```sh
+cd /var/mobile/shopee-autocoin/ios-jb
+python3 probe.py            # 先驗：只讀畫面，不點東西
+python3 bot.py run          # 開始（Ctrl-C 停止）
+sh start.sh                 # 一鍵開始的觸發器（Safari 加入主畫面後點一下）
+```
+
+裝法、一鍵開始的設定、以及「這一版 tweak 沒有取色／shell」等已查證的細節，都在
+[ios-jb/README.md](ios-jb/README.md)。風險提醒：越獄本身就是可被偵測的特徵。
 
 ## Nightly 建置（GitHub Actions）
 
 `.github/workflows/nightly.yml` 會在 push 到 `main`、每天台灣時間 02:00、或手動觸發時建 signed release APK，然後**更新同一個 `nightly` release**（固定檔名 `autocoin-nightly.apk`，每次覆蓋，不會愈積愈多）。
+
+發布前先執行 Windows／Linux Python 回歸測試、依賴漏洞檢查及 Android 測試、Lint、debug 建置。
+簽署與發布只接受 `main`；fork 未設定簽署 secrets 時會略過發布，仍保留測試結果。
+簽署 APK 經簽章與 SHA-256 檢查後才發布；發布工作才有 repository 寫入權限，簽署金鑰在建置後刪除。
 
 需要在 repo 的 Settings → Secrets and variables → Actions 設好這三個：
 
@@ -109,6 +132,27 @@ $env:TS_HOST = "192.168.31.196"                 # 手機的 IP
 - `KEYSTORE_PASSWORD`（同時當 store password 和 key password）
 
 本機沒設這三個環境變數時，`build.gradle.kts` 不會建立 signing config，`assembleDebug` 照常可用。
+
+## 離線驗證
+
+Python 3.11，可在沒有連接手機、沒有登入帳戶的情況執行：
+
+```powershell
+python -m venv .venv
+.venv\Scripts\python -m pip install --upgrade pip setuptools
+.venv\Scripts\python -m pip install -r requirements-dev.txt
+.venv\Scripts\python -m pytest -q
+.venv\Scripts\python -m unittest discover -s ios/tests -v
+.venv\Scripts\python -m unittest discover -s ios-jb/tests -v
+.venv\Scripts\python ios-jb/selftest.py
+.venv\Scripts\python -m ruff check autocoin ios ios-jb tests tools
+.venv\Scripts\python -m pip_audit --progress-spinner off
+.venv\Scripts\python tools/benchmark_ui.py
+```
+
+Android 需 JDK 21 與 Android 36 SDK：`cd android` 後執行
+`.\gradlew.bat testDebugUnitTest lintDebug assembleDebug`。Windows 建議使用純英文路徑；
+某些 Gradle 測試 worker 在中文路徑無法載入已編譯的 class。
 
 ## 降低機器指紋
 

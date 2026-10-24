@@ -13,12 +13,17 @@ from .ui import PKG, Node, Snapshot
 log = logging.getLogger(__name__)
 
 
+class UnsafeAction(RuntimeError):
+    """前景不符或動作結果不確定；不可自動重送。"""
+
+
 class Device:
     def __init__(self, serial: str, host: str = "127.0.0.1", port: int = 5037):
         self.serial = serial
         # 不用 adbutils 預設的 client：它讀 ANDROID_ADB_SERVER_PORT，使用者環境裡是 5137
         self.adb = adbutils.AdbClient(host=host, port=port)
         self.d: u2.Device | None = None
+        self.before_action = lambda: None
         self.connect()
 
     def connect(self):
@@ -27,11 +32,14 @@ class Device:
                 self.adb.connect(self.serial, timeout=10)
             except Exception as e:
                 log.warning("adb connect %s 失敗：%s", self.serial, e)
-        self.d = u2.connect(self.adb.device(self.serial))
+        device = self.adb.device(self.serial or None)
+        self.serial = device.serial
+        self.d = u2.connect(device)
 
     def _retry(self, fn):
         """連線偶爾會斷（Tailscale、uiautomator server 重啟），重連後再試。"""
         for attempt in range(3):
+            self.before_action()
             try:
                 return fn()
             except Exception as e:
@@ -39,6 +47,7 @@ class Device:
                     raise
                 log.warning("裝置操作失敗（%s: %s），重新連線後重試", type(e).__name__, e)
                 time.sleep(3 * (attempt + 1))
+                self.before_action()
                 try:
                     self.connect()
                 except Exception as e2:
@@ -94,26 +103,54 @@ class Device:
         r = self.tap_jitter_px
         return x + random.randint(-r, r), y + random.randint(-r, r)
 
+    def _action(self, command: list[str]):
+        self.before_action()
+        if self.current().get("package") != PKG or self.locked():
+            raise UnsafeAction("蝦皮不在前景或手機已鎖定，已停止操作")
+        self._send_once(command)
+
+    def _send_once(self, command: list[str]):
+        self.before_action()
+        try:
+            # uiautomator2 的 jsonrpc_call 自帶斷線重送，click 也會被重送。
+            # ADB 的公開 shell API 只送一次；連線錯誤即交給人確認結果。
+            result = self.adb.device(self.serial).shell2(command, timeout=10)
+            if result.returncode != 0:
+                raise RuntimeError(f"ADB 動作失敗，退出碼 {result.returncode}")
+        except Exception as exc:
+            raise UnsafeAction("裝置動作結果不明，已停止，請先確認手機畫面") from exc
+
     def tap(self, x: int, y: int):
         jx, jy = self._jitter_xy(x, y)
-        self._retry(lambda: self.d.click(jx, jy))
+        self._action(["input", "tap", str(max(0, jx)), str(max(0, jy))])
 
     def tap_node(self, node: Node):
-        self.tap(*node.spot)
+        if node is None or node.el.get("enabled") == "false":
+            raise UnsafeAction("UI 節點不存在或尚未啟用")
+        x, y = node.spot
+        self._action(["input", "tap", str(x), str(y)])
 
     def swipe(self, fx: int, fy: int, tx: int, ty: int, duration: float = 0.4):
         dx, dy = random.randint(-12, 12), random.randint(-12, 12)
         dur = max(0.05, duration * random.uniform(1 - self.swipe_jitter, 1 + self.swipe_jitter))
-        self._retry(lambda: self.d.swipe(fx + dx, fy + dy, tx + dx, ty + dy, duration=dur))
+        self._action(["input", "swipe", str(max(0, fx + dx)), str(max(0, fy + dy)),
+                      str(max(0, tx + dx)), str(max(0, ty + dy)), str(round(dur * 1000))])
+
+    def swipe_reference(self, fx: int, fy: int, tx: int, ty: int, duration: float = 0.4):
+        """研究座標來自 1080×2400，依目前裝置尺寸縮放。"""
+        width, height = self._retry(lambda: self.d.window_size())
+        self.swipe(round(fx * width / 1080), round(fy * height / 2400),
+                   round(tx * width / 1080), round(ty * height / 2400), duration)
 
     def back(self):
-        self._retry(lambda: self.d.press("back"))
+        self._action(["input", "keyevent", "4"])
 
     def wake(self):
-        self._retry(lambda: self.d.screen_on())
+        self._send_once(["input", "keyevent", "224"])
 
     def launch(self):
-        self._retry(lambda: self.d.app_start(PKG))
+        self._send_once(["monkey", "-p", PKG, "-c", "android.intent.category.LAUNCHER", "1"])
 
     def restart_app(self):
-        self._retry(lambda: self.d.app_start(PKG, stop=True))
+        self._action(["am", "force-stop", PKG])
+        self.launch()

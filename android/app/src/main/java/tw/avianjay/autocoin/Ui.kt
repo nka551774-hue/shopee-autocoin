@@ -28,7 +28,13 @@ data class Pt(val x: Int, val y: Int)
 
 /** 一次讀取的畫面，只保留蝦皮自己的節點（跟電腦版的 uiautomator dump 看到的一樣）。 */
 class Snap(val nodes: List<N>, val pkg: String, val activity: String) {
-    fun id(rid: String) = nodes.firstOrNull { it.rid == rid }
+    // A screen is immutable; build the frequently used ID lookup once per snapshot.
+    private val byId by lazy(LazyThreadSafetyMode.NONE) {
+        HashMap<String, N>(nodes.size).apply {
+            for (n in nodes) if (n.rid.isNotEmpty()) putIfAbsent(n.rid, n)
+        }
+    }
+    fun id(rid: String) = byId[rid]
     fun byPrefix(prefix: String) = nodes.filter { it.rid.startsWith(prefix) }
     fun text(t: String) = nodes.firstOrNull { it.text == t }
     fun desc(d: String) = nodes.firstOrNull { it.desc == d }
@@ -38,9 +44,16 @@ class Snap(val nodes: List<N>, val pkg: String, val activity: String) {
 
     /** 全部文字，但略過指定容器底下的（例如聊天室，觀眾可以打任何字）。 */
     fun textsExcluding(ids: Collection<String>): List<String> {
-        val skip = BooleanArray(nodes.size)
-        for (n in nodes) if (n.rid in ids) for (i in n.index until n.end) skip[i] = true
-        return nodes.filter { it.text.isNotEmpty() && !skip[it.index] }.map { it.text }
+        val texts = ArrayList<String>()
+        var i = 0
+        while (i < nodes.size) {
+            val n = nodes[i]
+            if (n.rid in ids) i = n.end else {
+                if (n.text.isNotEmpty()) texts.add(n.text)
+                i++
+            }
+        }
+        return texts
     }
 
     /** 給除錯用的文字版 dump。 */
@@ -61,6 +74,8 @@ class Snap(val nodes: List<N>, val pkg: String, val activity: String) {
         }
 
         private fun walk(info: AccessibilityNodeInfo, out: MutableList<N>, depth: Int) {
+            if (Thread.currentThread().isInterrupted) throw InterruptedException("讀取畫面已停止")
+            check(out.size < 20_000) { "UI 節點過多，暫停操作" }
             if (depth > 80 || !info.isVisibleToUser) return
             val rect = Rect()
             info.getBoundsInScreen(rect)
@@ -76,7 +91,7 @@ class Snap(val nodes: List<N>, val pkg: String, val activity: String) {
             out.add(n)
             for (i in 0 until info.childCount) {
                 val child = info.getChild(i) ?: continue
-                walk(child, out, depth + 1)
+                try { walk(child, out, depth + 1) } finally { child.recycle() }
             }
             n.end = out.size
         }

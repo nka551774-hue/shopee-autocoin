@@ -4,6 +4,7 @@
   所以刻意寫得中性：不要出現「自動領取」、「蝦幣」、「直播間」這類意圖描述。
 -->
 <resources>
+    <string name="status_running">蝦幣 ▶ %1$s</string>
     <string name="app_name">畫面輔助</string>
     <string name="service_description">協助讀取畫面上的文字與按鈕位置，方便操作時快速找到需要的項目。</string>
 </resources>

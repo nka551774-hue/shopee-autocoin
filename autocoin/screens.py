@@ -2,18 +2,20 @@
 from __future__ import annotations
 
 import re
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 
 from .ui import PKG, Node, Snapshot
 
-_TIME = re.compile(r"(\d+):(\d{2})")
+_TIME = re.compile(r"(\d{1,4}):([0-5]\d)")
 _NUM = re.compile(r"\d+(?:\.\d+)?")
 
 
 def num(text: str) -> float | None:
     m = _NUM.search(text or "")
-    return float(m.group()) if m else None
+    value = float(m.group()) if m else None
+    return value if value is not None and math.isfinite(value) else None
 
 
 def inside(point: tuple[int, int], bounds: tuple[int, int, int, int]) -> bool:
@@ -26,7 +28,7 @@ def number_near(s: Snapshot, anchor: Node, below: bool) -> float | None:
     """找 anchor 正上方或正下方最近的純數字文字（面板上的金額都是這樣排的）。"""
     ax1, ay1, ax2, ay2 = anchor.bounds
     best = None
-    for n in s.nodes:
+    for n in s.trusted_nodes:
         if not re.fullmatch(r"\d+(?:\.\d+)?", n.text):
             continue
         x1, y1, x2, y2 = n.bounds
@@ -34,7 +36,9 @@ def number_near(s: Snapshot, anchor: Node, below: bool) -> float | None:
             continue
         gap = (y1 - ay2) if below else (ay1 - y2)
         if -20 <= gap <= 150 and (best is None or gap < best[0]):
-            best = (gap, float(n.text))
+            value = num(n.text)
+            if value is not None:
+                best = (gap, value)
     return best[1] if best else None
 
 
@@ -55,7 +59,7 @@ class Screen(str, Enum):
 
 
 def detect(s: Snapshot) -> Screen:
-    if s.package and s.package != PKG:
+    if s.package != PKG:
         return Screen.OTHER_APP
     # 疊在直播間上面的東西先判斷
     if s.id("fl_lucky_result"):
@@ -97,7 +101,7 @@ class Task:
 
     @property
     def claimable(self) -> bool:
-        return self.state.strip() == "領取"
+        return self.button is not None and self.state.strip() == "領取"
 
 
 def _task(box: Node | None) -> Task:

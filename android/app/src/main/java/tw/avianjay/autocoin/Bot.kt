@@ -2,7 +2,6 @@ package tw.avianjay.autocoin
 
 import java.time.LocalDateTime
 import java.time.LocalTime
-import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import kotlin.math.roundToInt
 
@@ -70,7 +69,16 @@ class Bot(
 
     // ---------------- 基本工具 ----------------
     private fun now() = System.currentTimeMillis()
+    private fun elapsedNow() = System.nanoTime() / 1_000_000
     private fun sleep(ms: Long) = Thread.sleep(Jitter.ms(ms))  // 按停止會 interrupt，丟出 InterruptedException 就整個結束
+
+    private fun snapshot(): Snap {
+        if (Thread.currentThread().isInterrupted) throw InterruptedException("已停止")
+        store.requireReady()
+        val snap = phone.snapshot()
+        checkRisk(snap, phone.lastToast())
+        return snap
+    }
 
     // 每個直播間用不同的上限，避免「每次都剛好待 10.5 分鐘」這種固定週期指紋
     private val roomCaps = HashMap<String, Double>()
@@ -78,15 +86,15 @@ class Bot(
         roomCaps.getOrPut("$key@$base") { Jitter.up(base, pct) }
 
     private fun look(): Pair<Screen, Snap> {
-        val s = phone.snapshot()
+        val s = snapshot()
         return detect(s) to s
     }
 
     private fun waitFor(wanted: Set<Screen>, timeoutMs: Long = 10_000): Pair<Screen, Snap> {
-        val deadline = now() + timeoutMs
+        val deadline = elapsedNow() + timeoutMs
         while (true) {
             val cur = look()
-            if (cur.first in wanted || now() >= deadline) return cur
+            if (cur.first in wanted || elapsedNow() >= deadline) return cur
             sleep(700)
         }
     }
@@ -95,20 +103,25 @@ class Bot(
     private fun capture(tag: String, s: Snap?) {
         try {
             val snap = s ?: phone.snapshot()
-            phone.save("${LocalDateTime.now().format(STAMP)}-${tag.replace(Regex("""[^\w.-]+"""), "_")}.txt", snap.dump())
+            phone.save("${LocalDateTime.now(REWARD_ZONE).format(STAMP)}-${tag.replace(Regex("""[^\w.-]+"""), "_")}.txt", snap.dump())
         } catch (e: Exception) {
+            if (e is InterruptedException) throw e
             AppLog.d("存畫面失敗：$e")
         }
+    }
+
+    private fun checkRisk(s: Snap, toast: String) {
+        val risk = (s.textsExcluding(FREE_TEXT_IDS) + toast)
+            .firstOrNull { text -> MSG_RISK.any { it in text } } ?: return
+        capture("risk", s)
+        throw StopBot("蝦皮回報「$risk」，為了帳號安全先停止")
     }
 
     /** 比對 App 的提示文字。遇到風控就停止；回傳 daily_limit / room_done / 空字串。 */
     private fun checkMessages(s: Snap, toast: String = ""): String {
         val texts = s.textsExcluding(FREE_TEXT_IDS) + listOf(toast).filter { it.isNotEmpty() }
         fun hit(keys: List<String>) = texts.firstOrNull { t -> keys.any { it in t } }
-        hit(MSG_RISK)?.let {
-            capture("risk", s)
-            throw StopBot("蝦皮回報「$it」，為了帳號安全先停止")
-        }
+        checkRisk(s, toast)
         hit(MSG_DAILY_LIMIT)?.let {
             if (!day.coinLimitHit) {
                 AppLog.i("直播間蝦幣今天的次數用完了（$it）")
@@ -124,6 +137,7 @@ class Bot(
     private fun ensureApp() {
         var waiting = ""
         while (true) {
+            store.requireReady()
             if (!phone.screenOn() || phone.locked()) {
                 if (waiting != "screen") {
                     AppLog.w("螢幕關著或鎖定中，等解鎖…")
@@ -246,11 +260,11 @@ class Bot(
                 val cur = waitFor(setOf(Screen.EXPLORE), 8000)
                 if (cur.first != Screen.EXPLORE) return@repeat
                 sleep(2000)  // 廣告彈窗通常晚一點才出來
-                s = phone.snapshot()
+                s = snapshot()
             }
             if (dismissPopup(s)) {
                 sleep(1000)
-                s = phone.snapshot()
+                s = snapshot()
             }
             return s
         }
@@ -275,7 +289,7 @@ class Bot(
             if (readCards(s).any { it.rid == "live_card_cover_0" }) return s
             phone.swipe(x(590), y(700), x(590), y(2000), 300)
             sleep(800)
-            s = phone.snapshot()
+            s = snapshot()
         }
         return s
     }
@@ -296,7 +310,7 @@ class Bot(
             if (page == cfg.explorePages || (page > 0 && new == 0)) break
             phone.swipe(x(590), y(1900), x(590), y(700), 500)
             sleep(1200)
-            s = phone.snapshot()
+            s = snapshot()
         }
         return cards
     }
@@ -324,7 +338,7 @@ class Bot(
     /** 捲回那張卡片並點進去。 */
     private fun enter(card: Card): Snap? {
         repeat(cfg.explorePages * 2 + 2) {
-            val s = phone.snapshot()
+            val s = snapshot()
             val hit = readCards(s).firstOrNull { it.rid == card.rid && it.height >= y(300) }
             if (hit != null) {
                 phone.tap(hit.center)
@@ -344,7 +358,7 @@ class Bot(
         val cards = scan(scrollTop(s))
         val (card, purpose) = choose(cards)
         if (card == null) {
-            closeExplore(phone.snapshot())
+            closeExplore(snapshot())
             return null to ""
         }
         val badge = card.maxCoins?.let { "最多 ${"%.2f".format(it).trimEnd('0').trimEnd('.')}" }
@@ -368,7 +382,8 @@ class Bot(
     // ---------------- 待在直播間 ----------------
     /** 待在目前的直播間直到該走了。purpose：coins / wheel / watch。回傳（原因, 直播主）。 */
     private fun stay(purpose: String): Pair<String, String> {
-        val start = now()
+        val start = elapsedNow()
+        val stayDate = day.date
         var coinMissing = 0L
         var oddState = 0L
         var watchStuck = 0L
@@ -377,6 +392,7 @@ class Bot(
         var lastWheel = ""
         var key = ""
         while (true) {
+            if (day.date != stayDate) return "new_day" to key
             val (scr, s) = look()
             if (scr != Screen.ROOM) {
                 if (!backToRoom(scr, s)) return "lost" to key
@@ -408,8 +424,8 @@ class Bot(
 
             // 觀看任務到點會自己領，卡在「領取」太久才幫忙按
             if (r.watch.claimable) {
-                if (watchStuck == 0L) watchStuck = now()
-                if (now() - watchStuck > 15_000) {
+                if (watchStuck == 0L) watchStuck = elapsedNow()
+                if (elapsedNow() - watchStuck > 15_000) {
                     r.watch.button?.let { phone.tap(it) }
                     watchStuck = 0L
                 }
@@ -427,7 +443,7 @@ class Bot(
                 continue
             }
 
-            val elapsed = now() - start
+            val elapsed = elapsedNow() - start
             if (elapsed > roomCap(key, cfg.maxRoomMinutes) * 60_000) return "timeout" to key
             if (purpose == "watch") {
                 if (elapsed > roomCap(key, cfg.watchRoomMinutes) * 60_000) return "watched" to key
@@ -438,8 +454,8 @@ class Bot(
 
             // 直播間蝦幣
             if (!r.coin.present) {
-                if (coinMissing == 0L) coinMissing = now()
-                if (now() - coinMissing > cfg.noCoinGraceMs) return "no_coins" to key
+                if (coinMissing == 0L) coinMissing = elapsedNow()
+                if (elapsedNow() - coinMissing > cfg.noCoinGraceMs) return "no_coins" to key
                 sleep(3000)
                 continue
             }
@@ -451,8 +467,8 @@ class Bot(
             }
             val secs = r.coin.seconds
             if (secs == null) {
-                if (oddState == 0L) oddState = now()
-                if (now() - oddState > 30_000) {
+                if (oddState == 0L) oddState = elapsedNow()
+                if (elapsedNow() - oddState > 30_000) {
                     capture("coin-${r.coin.state}", s)
                     return "coin_state:${r.coin.state}" to key
                 }
@@ -471,13 +487,19 @@ class Bot(
     private fun claim(r: Room) {
         val key = r.key
         val before = r.coin.coin ?: 0.0
+        val button = r.coin.button ?: return
         phone.clearToast()
-        r.coin.button?.let { phone.tap(it) }
+        phone.tap(button)
         var amount: Double? = null
-        val deadline = now() + 8000
-        while (now() < deadline) {
-            val s = phone.snapshot()
-            val got = readRoom(s).claimed
+        val deadline = elapsedNow() + 8000
+        while (elapsedNow() < deadline) {
+            val s = snapshot()
+            val room = readRoom(s)
+            if (detect(s) != Screen.ROOM || room.key != key) {
+                AppLog.w("領取後畫面或直播間已改變，無法確認結果")
+                return
+            }
+            val got = room.claimed
             if ("成功" in got) {
                 amount = num(got) ?: before
                 break
@@ -490,16 +512,12 @@ class Bot(
             sleep(300)
         }
         if (amount == null) {
-            // 沒看到成功提示：倒數已經重新開始的話也算成功
-            val s = phone.snapshot()
+            val s = snapshot()
             val after = readRoom(s).coin
-            if ((after.seconds ?: 0) > 120) {
-                amount = before
-            } else {
-                AppLog.w("直播間蝦幣按了沒反應（現在顯示：${after.state.ifEmpty { "不見了" }}）")
-                capture("claim-unknown", s)
-                return
-            }
+            // A reset timer can also mean that the round expired or the room changed.
+            AppLog.w("直播間蝦幣結果未確認（現在顯示：${after.state.ifEmpty { "不見了" }}），不記入成功統計")
+            capture("claim-unknown", s)
+            return
         }
         val day = this.day
         val room = day.room(key)
@@ -513,7 +531,7 @@ class Bot(
         //（那個位置按下去會打開任務獎勵面板）
         for (i in 0 until 10) {
             sleep(800)
-            if (!readRoom(phone.snapshot()).coin.claimable) break
+            if (!readRoom(snapshot()).coin.claimable) break
         }
     }
 
@@ -536,7 +554,6 @@ class Bot(
                 s.id("tv_confirm")?.let { phone.tap(it.center) }
                 // 對話框關掉後它的空殼視窗會擋一陣子，期間讀不到底下的轉盤（轉盤其實還開著）
                 cur = waitFor(setOf(Screen.WHEEL, Screen.WHEEL_RESULT), 8000)
-                if (cur.first == Screen.UNKNOWN) cur = Screen.WHEEL to cur.second
                 continue
             }
             if (scr != Screen.WHEEL || spins >= 3) break
@@ -545,7 +562,8 @@ class Bot(
                 break
             }
             // 「開始」沒有獨立節點，按轉盤正中央
-            phone.tap(s.id("iv_draw_light")?.center ?: Pt(x(540), y(1100)))
+            val target = s.id("iv_draw_light") ?: break
+            phone.tap(target.center)
             spins++
             cur = waitFor(setOf(Screen.WHEEL_RESULT, Screen.FOLLOW_DIALOG), 12_000)
         }
@@ -603,13 +621,14 @@ class Bot(
 
     // ---------------- 任務獎勵面板 ----------------
     private fun panelDue(): Boolean {
+        if (elapsedNow() < nextPanelAttempt) return false
         // 門檻每個週期只抽一次，避免「每跑一圈都重抽」而提早觸發
         val base = (cfg.panelEveryMinutes * 60_000).toLong()
         if (panelKey != day.lastPanel) {
             panelKey = day.lastPanel
             panelThresholdMs = Jitter.ms(base, 0.25)
         }
-        if (now() - day.lastPanel > panelThresholdMs) return true
+        if (day.lastPanel > now() || now() - day.lastPanel > panelThresholdMs) return true
         // 觀看任務的蝦幣要當天領，23:35~23:50 之間隨機挑一個時間點再開一次
         val late = latePanelAt()
         return now() >= late && day.lastPanel < late
@@ -617,12 +636,13 @@ class Bot(
 
     private var panelKey = -1L
     private var panelThresholdMs = 0L
+    private var nextPanelAttempt = 0L
 
     /** 每天固定的收尾時間（同一天內固定，換日才會變）。 */
     private fun latePanelAt(): Long {
         val minute = 35 + (day.date.hashCode().mod(16))
-        return LocalDateTime.now().withHour(23).withMinute(minute).withSecond(0).withNano(0)
-            .atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+        return LocalDateTime.now(REWARD_ZONE).withHour(23).withMinute(minute).withSecond(0).withNano(0)
+            .atZone(REWARD_ZONE).toInstant().toEpochMilli()
     }
 
     private fun pendingAmount(s: Snap): Double? {
@@ -632,16 +652,15 @@ class Bot(
     }
 
     /** 開任務獎勵面板：把觀看任務的蝦幣領進待提領，需要時提領。直播間會縮成浮窗，倒數不受影響。 */
-    private fun panelTasks(final: Boolean = false) {
+    private fun panelTasks(final: Boolean = false): Boolean {
         val day = this.day
-        day.lastPanel = now()
-        store.save()
+        nextPanelAttempt = elapsedNow() + 60_000
         var (scr, s) = look()
         if (scr == Screen.ROOM) {
             val banner = readRoom(s).banner
             if (banner == null) {
                 AppLog.i("這間沒有任務獎勵入口，晚點再開面板")
-                return
+                return false
             }
             phone.tap(banner)
             val cur = waitFor(setOf(Screen.PANEL), 10_000)
@@ -651,36 +670,50 @@ class Bot(
         if (scr != Screen.PANEL) {
             AppLog.w("任務獎勵面板沒打開（目前在${scr.label}）")
             backToRoom(scr, s)
-            return
+            return false
         }
         sleep(1500)  // 等 RN 畫面載完
-        s = phone.snapshot()
+        s = snapshot()
+        if (detect(s) != Screen.PANEL) return false
         val btn = s.text("領取")
         if (btn != null) {
             val amount = numberNear(s, btn, below = false) ?: 0.0
+            val pendingBefore = pendingAmount(s)
             phone.tap(btn.center)
             sleep(3000)
-            s = phone.snapshot()
-            day.watchTotal = round2(day.watchTotal + amount)
-            AppLog.i("✔ 觀看任務 +%.2f（領進待提領）".format(amount))
+            s = snapshot()
+            val pendingAfter = pendingAmount(s)
+            if (detect(s) == Screen.PANEL && amount > 0.0 && pendingBefore != null && pendingAfter != null &&
+                pendingAfter >= pendingBefore + amount - 0.01) {
+                day.watchTotal = round2(day.watchTotal + amount)
+                AppLog.i("✔ 觀看任務 +%.2f（領進待提領）".format(amount))
+            } else {
+                AppLog.w("觀看任務領取結果未確認，不記入成功統計")
+                capture("watch-claim-unknown", s)
+                return false
+            }
         }
         // 進度條下有「N分鐘」和終點的「90分鐘」兩個標籤；只剩一個 90 的話分不出是哪個，就不更新
-        val minutes = s.nodes.mapNotNull { Regex("""(\d+)分鐘""").matchEntire(it.text)?.groupValues?.get(1)?.toInt() }.sorted()
+        val minutes = s.nodes.mapNotNull {
+            Regex("""(\d+)分鐘""").matchEntire(it.text)?.groupValues?.get(1)?.toIntOrNull()?.takeIf { m -> m in 0..90 }
+        }.sorted()
         if (minutes.size >= 2 || (minutes.isNotEmpty() && minutes[0] != 90)) day.watchMinutes = minutes[0]
         if (s.text("明天再來") != null || day.watchMinutes >= 90) day.watchDone = true
         pendingAmount(s)?.let { day.pending = it }
+        day.lastPanel = now()
         store.save()
         AppLog.i("待提領 %.2f｜觀看任務 %d/90 分鐘".format(day.pending, day.watchMinutes))
         if (shouldWithdraw(day.pending, final)) withdraw(s)
         val cur = look()
         backToRoom(cur.first, cur.second)
+        return true
     }
 
     private fun shouldWithdraw(pending: Double, final: Boolean): Boolean {
         val day = this.day
         // 提領是可選的，而且蝦皮規定每天最多 3 次
-        if (!cfg.withdraw || day.withdrawals >= cfg.withdrawDailyLimit || pending < 1) return false
-        val t = LocalTime.now()
+        if (!cfg.withdraw || day.withdrawalUncertain || day.withdrawals >= cfg.withdrawDailyLimit || pending < 1) return false
+        val t = LocalTime.now(REWARD_ZONE)
         val late = t.hour == 23 && t.minute >= 40
         return pending >= cfg.withdrawMin || final || late
     }
@@ -688,6 +721,7 @@ class Bot(
     /** 在面板按「提領」，選不超過待提領的最大面額，送出並確認待提領有變少。 */
     private fun withdraw(panel: Snap) {
         val day = this.day
+        if (day.withdrawalUncertain || !cfg.withdraw || day.withdrawals >= cfg.withdrawDailyLimit) return
         val btn = panel.text("提領") ?: return
         phone.tap(btn.center)
         val (scr, page) = waitFor(setOf(Screen.WITHDRAW), 10_000)
@@ -696,12 +730,13 @@ class Bot(
             return
         }
         sleep(1000)
-        var s = phone.snapshot()
-        val pending = pendingAmount(s) ?: pendingAmount(page) ?: day.pending
+        var s = snapshot()
+        if (detect(s) != Screen.WITHDRAW) return
+        val pending = pendingAmount(s) ?: pendingAmount(page) ?: return
         val floatWin = s.id("rl_float_window")?.bounds  // 直播浮窗會蓋住部分選項
         val options = s.nodes.mapNotNull { n ->
-            val amt = Regex("""(\d+)\.00""").matchEntire(n.text)?.groupValues?.get(1)?.toInt() ?: return@mapNotNull null
-            if (amt > pending || (floatWin != null && floatWin.contains(n.cx, n.cy))) null else amt to n
+            val amt = Regex("""(\d+)\.00""").matchEntire(n.text)?.groupValues?.get(1)?.toIntOrNull() ?: return@mapNotNull null
+            if (amt <= 0 || amt > pending || (floatWin != null && floatWin.contains(n.cx, n.cy))) null else amt to n
         }
         val choice = options.maxByOrNull { it.first }
         if (choice == null) {
@@ -712,29 +747,28 @@ class Bot(
         val (amount, node) = choice
         phone.tap(node.center)
         sleep(1000)
-        val submit = phone.snapshot().text("立即提領")
+        val submitPage = snapshot()
+        val submit = if (detect(submitPage) == Screen.WITHDRAW) submitPage.text("立即提領") else null
         if (submit == null) {
             AppLog.w("找不到「立即提領」")
             phone.back()
             return
         }
         phone.clearToast()
+        day.withdrawalUncertain = true
+        store.save()
         phone.tap(submit.center)
         var done = false
         for (i in 0 until 10) {
             sleep(1000)
-            s = phone.snapshot()
-            val confirm = s.nodes.firstOrNull { it.text in CONFIRM_TEXTS }
-            if (confirm != null) {
-                phone.tap(confirm.center)
-                continue
-            }
+            s = snapshot()
             // 每天只能提領 3 次；如果手動提領過，計數會少算，看到上限提示就當作今天用完
             val limit = (s.textsExcluding(emptySet()) + phone.lastToast())
                 .firstOrNull { "上限" in it || ("次" in it && "已" in it && "提領" in it) }
             if (limit != null) {
                 AppLog.i("提領被拒：$limit，今天不再提領")
                 day.withdrawals = cfg.withdrawDailyLimit
+                day.withdrawalUncertain = false
                 store.save()
                 done = true
                 break
@@ -744,14 +778,17 @@ class Bot(
                 day.withdrawals++
                 day.withdrawn += amount
                 day.pending = after
+                day.withdrawalUncertain = false
                 store.save()
                 AppLog.i("✔ 提領 %d 蝦幣到「我的蝦幣」（待提領剩 %.2f，今天第 %d/3 次）".format(amount, after, day.withdrawals))
                 done = true
                 break
             }
+            val confirm = s.nodes.firstOrNull { it.text in CONFIRM_TEXTS }
+            if (confirm != null && detect(s) == Screen.WITHDRAW) phone.tap(confirm.center)
         }
         if (!done) {
-            AppLog.w("提領結果不明，畫面已存檔")
+            AppLog.w("提領結果不明，畫面已存檔；自動提領已鎖定，請先核對帳戶與統計資料")
             capture("withdraw-unknown", s)
         }
         phone.back()
@@ -761,8 +798,10 @@ class Bot(
     fun run() {
         AppLog.i("開始：${store.summary()}")
         try {
+            store.requireReady()
             while (true) {
                 try {
+                    store.requireReady()
                     ensureApp()
                     cycle()
                 } catch (e: StopBot) {
@@ -783,6 +822,12 @@ class Bot(
 
     private fun cycle() {
         val day = this.day
+        if (cacheDate != day.date) {
+            cacheDate = day.date
+            rainSeen.clear()
+            roomCaps.clear()
+            nextPanelAttempt = 0
+        }
         if (day.coinLimitHit && day.wheelDone && day.watchDone) {
             restUntilTomorrow()
             return
@@ -808,12 +853,15 @@ class Bot(
         finishRoom(setOf(card.key, key), reason, purpose)
     }
 
+    private var cacheDate = ""
+
     private fun finishRoom(keys0: Set<String>, reason: String, purpose: String) {
+        if (reason == "new_day") return
         val day = this.day
         val keys = keys0.filter { it.isNotEmpty() }
         for (k in keys) {
             val room = day.room(k)
-            if (purpose == "watch") room.watched = true
+            if (purpose == "watch" && reason == "watched") room.watched = true
             if (reason in DONE_REASONS || reason.startsWith("coin_state")) room.done = true
         }
         store.save()
@@ -826,14 +874,17 @@ class Bot(
         val day = this.day
         if (!day.finalPanel) {
             goLive()
-            panelTasks(final = true)
+            if (!panelTasks(final = true)) {
+                sleep(60_000)
+                return
+            }
             day.finalPanel = true
             store.save()
         }
         AppLog.i("今天能領的都領完了，休息到明天：${store.summary()}")
         status("今天領完了，明天再來")
-        val wake = LocalDateTime.now().plusDays(1).withHour(0).withMinute(3).withSecond(0)
-            .atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+        val wake = LocalDateTime.now(REWARD_ZONE).plusDays(1).withHour(0).withMinute(3).withSecond(0)
+            .atZone(REWARD_ZONE).toInstant().toEpochMilli()
         while (now() < wake) sleep(minOf(300_000L, maxOf(1000L, wake - now())))
     }
 }

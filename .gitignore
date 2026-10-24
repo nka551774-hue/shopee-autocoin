@@ -13,7 +13,12 @@ env/
 logs/
 state.json
 state-ios.json
+state-ios-jb.json
+state*.json.lock
+state*.json.*.tmp
 *.log
+.pytest_cache/
+.ruff_cache/
 
 # Android and Gradle
 .gradle/

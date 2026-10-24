@@ -16,6 +16,7 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.TextView
 import java.io.File
+import java.lang.ref.WeakReference
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
@@ -28,13 +29,15 @@ class CoinService : AccessibilityService(), Phone {
     companion object {
         private const val STOPPED = "蝦幣 ■ 已停止（點這裡開始）"
 
-        @Volatile
-        var instance: CoinService? = null
-            private set
+        @Volatile private var serviceRef = WeakReference<CoinService>(null)
+        var instance: CoinService?
+            get() = serviceRef.get()
+            private set(value) { serviceRef = WeakReference(value) }
     }
 
     private val main = Handler(Looper.getMainLooper())
     @Volatile private var worker: Thread? = null
+    @Volatile private var stopping = false
     @Volatile private var toast = ""
     @Volatile private var shopeeWindowClass = ""
     @Volatile var statusText = "已停止"
@@ -55,13 +58,16 @@ class CoinService : AccessibilityService(), Phone {
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
         when (event.eventType) {
             AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED ->
-                if (event.className?.contains("Toast") == true) toast = event.text.joinToString("")
+                if (event.packageName?.toString() == SHOPEE && event.className?.contains("Toast") == true) {
+                    toast = event.text.joinToString("")
+                }
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ->
-                if (event.packageName == SHOPEE) shopeeWindowClass = event.className?.toString() ?: ""
+                if (event.packageName?.toString() == SHOPEE) shopeeWindowClass = event.className?.toString() ?: ""
+            else -> Unit
         }
     }
 
-    override fun onInterrupt() {}
+    override fun onInterrupt() = stopBot()
 
     override fun onUnbind(intent: Intent?): Boolean {
         stopBot()
@@ -70,38 +76,71 @@ class CoinService : AccessibilityService(), Phone {
         return super.onUnbind(intent)
     }
 
+    override fun onDestroy() {
+        stopBot()
+        hideBadge()
+        if (instance === this) instance = null
+        super.onDestroy()
+    }
+
     // ---------------- 開始 / 停止 ----------------
+    @Synchronized
     fun startBot() {
-        if (running) return
+        // Keep ownership until the old worker has actually returned. Otherwise a quick
+        // stop/start can leave two threads issuing gestures and writing the same state.
+        if (worker != null) return
+        stopping = false
+        clearToast()
         val bot = Bot(this, Store(this), Settings(this)) { setStatus(it) }
-        worker = Thread({
+        val thread = Thread({
             try {
                 bot.run()
             } finally {
-                if (worker === Thread.currentThread()) worker = null
-                showStopped()
+                synchronized(this@CoinService) {
+                    if (worker === Thread.currentThread()) {
+                        worker = null
+                        stopping = false
+                        showStopped()
+                    }
+                }
             }
-        }, "autocoin").apply { start() }
+        }, "autocoin")
+        worker = thread
         setStatus("執行中")
         keepScreenOn(true)
+        thread.start()
     }
 
+    @Synchronized
     fun stopBot() {
-        worker?.interrupt()
-        worker = null
-        showStopped()
+        val thread = worker
+        if (thread == null) {
+            showStopped()
+            return
+        }
+        stopping = true
+        statusText = "正在停止"
+        thread.interrupt()
+        main.post {
+            if (stopping) badge?.text = "蝦幣 ■ 正在停止"
+            if (stopping || !running) keepScreenOn(false)
+        }
     }
 
+    @Synchronized
     private fun setStatus(text: String) {
+        if (stopping) return
         statusText = text
-        main.post { badge?.text = "蝦幣 ▶ $text" }
+        main.post { if (running && !stopping && statusText == text) badge?.text = getString(R.string.status_running, text) }
     }
 
     private fun showStopped() {
         statusText = "已停止"
         main.post {
-            badge?.text = STOPPED
-            keepScreenOn(false)
+            if (!running) {
+                badge?.text = STOPPED
+                keepScreenOn(false)
+            }
         }
     }
 
@@ -156,16 +195,30 @@ class CoinService : AccessibilityService(), Phone {
         get() = getSystemService(WindowManager::class.java).currentWindowMetrics.bounds.height()
 
     override fun snapshot(): Snap {
+        checkWorker()
+        val pkg = foreground()
+        if (pkg != SHOPEE) return Snap(emptyList(), pkg, "")
         val roots = ArrayList<AccessibilityNodeInfo>()
         try {
             for (w in windows) {
-                val root = w.root ?: continue
-                if (root.packageName == SHOPEE) roots.add(root)
+                try {
+                    val root = w.root ?: continue
+                    if (root.packageName?.toString() == SHOPEE) roots.add(root) else root.recycle()
+                } finally {
+                    w.recycle()
+                }
             }
         } catch (_: Exception) {
         }
-        if (roots.isEmpty()) rootInActiveWindow?.takeIf { it.packageName == SHOPEE }?.let { roots.add(it) }
-        return Snap.build(roots, foreground(), shopeeWindowClass)
+        if (roots.isEmpty()) rootInActiveWindow?.let {
+            if (it.packageName?.toString() == SHOPEE) roots.add(it) else it.recycle()
+        }
+        return try {
+            val active = foreground()
+            if (active != SHOPEE) Snap(emptyList(), active, "") else Snap.build(roots, active, shopeeWindowClass)
+        } finally {
+            roots.forEach { it.recycle() }
+        }
     }
 
     // 點擊位置與按壓時間都加抖動：不要每次都落在節點正中央的同一個像素
@@ -185,27 +238,62 @@ class CoinService : AccessibilityService(), Phone {
 
     private fun gesture(path: Path, ms: Long) {
         val done = CountDownLatch(1)
+        var completed = false
         val stroke = GestureDescription.StrokeDescription(path, 0, ms)
-        val ok = dispatchGesture(GestureDescription.Builder().addStroke(stroke).build(), object : GestureResultCallback() {
-            override fun onCompleted(g: GestureDescription?) = done.countDown()
+        val callback = object : GestureResultCallback() {
+            override fun onCompleted(g: GestureDescription?) {
+                completed = true
+                done.countDown()
+            }
             override fun onCancelled(g: GestureDescription?) = done.countDown()
-        }, null)
-        if (ok) done.await(ms + 2000, TimeUnit.MILLISECONDS)
+        }
+        val ok = synchronized(this) {
+            checkControl()
+            dispatchGesture(GestureDescription.Builder().addStroke(stroke).build(), callback, main)
+        }
+        check(ok && done.await(ms + 2000, TimeUnit.MILLISECONDS) && completed) { "手勢未完成，重新讀取畫面" }
+        checkWorker()
         Thread.sleep(Jitter.ms(80, 0.6))
     }
 
     override fun back() {
-        performGlobalAction(GLOBAL_ACTION_BACK)
+        synchronized(this) {
+            checkControl(allowSystem = true)
+            check(performGlobalAction(GLOBAL_ACTION_BACK)) { "返回操作未完成" }
+        }
         Thread.sleep(Jitter.ms(100, 0.6))
     }
 
-    override fun foreground(): String = rootInActiveWindow?.packageName?.toString() ?: ""
+    private fun checkWorker() {
+        if (stopping || Thread.currentThread().isInterrupted || worker !== Thread.currentThread()) {
+            throw InterruptedException("自動操作已停止")
+        }
+    }
+
+    private fun checkControl(allowSystem: Boolean = false) {
+        checkWorker()
+        check(screenOn() && !locked()) { "螢幕已鎖定，暫停操作" }
+        val pkg = foreground()
+        check(pkg == SHOPEE || (allowSystem && pkg in setOf("android", "com.android.intentresolver"))) {
+            "前景已變成 $pkg，暫停操作"
+        }
+    }
+
+    override fun foreground(): String {
+        val root = rootInActiveWindow ?: return ""
+        return try { root.packageName?.toString() ?: "" } finally { root.recycle() }
+    }
 
     override fun screenOn() = getSystemService(PowerManager::class.java).isInteractive
 
     override fun locked() = getSystemService(KeyguardManager::class.java).isKeyguardLocked
 
+    @Synchronized
     override fun launchShopee() {
+        checkWorker()
+        check(screenOn() && !locked()) { "螢幕已鎖定，暫停開啟 App" }
+        val pkg = foreground()
+        check(pkg.isEmpty() || pkg == SHOPEE || pkg == ownPackage || pkg == homePackage()) { "前景已變成 $pkg，暫停開啟 App" }
         val intent = packageManager.getLaunchIntentForPackage(SHOPEE) ?: run {
             AppLog.w("找不到蝦皮 App")
             return
