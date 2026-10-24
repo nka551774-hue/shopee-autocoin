@@ -57,7 +57,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sdkmanager "platforms;android-36" "build-tools;36.0.0"
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          MGR="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$MGR"
+          "$MGR" "platforms;android-36" "build-tools;36.0.0"
       - name: Test, lint and build
         working-directory: android
         shell: bash
