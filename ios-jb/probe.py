@@ -24,7 +24,11 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
+sys.path.insert(1, str(ROOT))
+
+from autocoin.state import Store  # noqa: E402
 
 from screens import NAME_BOX, TASK_BOX, Shot, button_box, read_panel, read_room  # noqa: E402
 from zxtouch import ZXTouch, ZXTouchError  # noqa: E402
@@ -60,6 +64,11 @@ def main():
     if any(not math.isfinite(value) or value < 0 for value in (args.tap or []) + (args.swipe or [])):
         p.error("座標必須是有限且非負的數值")
 
+    with Store(ROOT / "state-ios.json").exclusive():
+        return run_session(args)
+
+
+def run_session(args):
     print(f"連線 {args.host}:{args.port} ...")
     try:
         zx = ZXTouch(args.host, args.port)

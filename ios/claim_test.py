@@ -5,6 +5,12 @@ import io
 import re
 import sys
 import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from autocoin.state import Store  # noqa: E402
 
 from PIL import Image
 
@@ -32,6 +38,11 @@ def shot(ts):
 
 
 def main():
+    with Store(ROOT / "state-ios.json").exclusive():
+        return run_session()
+
+
+def run_session():
     sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
     deadline = time.time() + float(sys.argv[1] if len(sys.argv) > 1 else 600)
     ts = TouchSynthesis(timeout=40)

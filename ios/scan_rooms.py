@@ -4,6 +4,12 @@ from __future__ import annotations
 import io
 import sys
 import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from autocoin.state import Store  # noqa: E402
 
 from PIL import Image
 
@@ -14,6 +20,11 @@ TASK_BOX = (220, 120, 375, 360)  # 右上角任務框（含下方的轉盤／福
 
 
 def main():
+    with Store(ROOT / "state-ios.json").exclusive():
+        return run_session()
+
+
+def run_session():
     sys.stdout.reconfigure(encoding="utf-8")
     limit = int(sys.argv[1]) if len(sys.argv) > 1 else 20
     ts = TouchSynthesis(timeout=40)

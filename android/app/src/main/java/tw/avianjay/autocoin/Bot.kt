@@ -498,8 +498,7 @@ class Bot(
             val s = snapshot()
             val room = readRoom(s)
             if (detect(s) != Screen.ROOM || room.key != key) {
-                AppLog.w("領取後畫面或直播間已改變，無法確認結果")
-                return
+                throw StopBot("領取後畫面或直播間已改變，結果不明；停止以避免重複操作")
             }
             val got = room.claimed
             if ("成功" in got) {
@@ -519,7 +518,7 @@ class Bot(
             // A reset timer can also mean that the round expired or the room changed.
             AppLog.w("直播間蝦幣結果未確認（現在顯示：${after.state.ifEmpty { "不見了" }}），不記入成功統計")
             capture("claim-unknown", s)
-            return
+            throw StopBot("直播間領取結果不明；停止以避免重複操作")
         }
         val day = this.day
         val room = day.room(key)
@@ -696,7 +695,7 @@ class Bot(
             } else {
                 AppLog.w("觀看任務領取結果未確認，不記入成功統計")
                 capture("watch-claim-unknown", s)
-                return false
+                throw StopBot("觀看任務領取結果不明；停止以避免重複操作")
             }
         }
         // 進度條下有「N分鐘」和終點的「90分鐘」兩個標籤；只剩一個 90 的話分不出是哪個，就不更新

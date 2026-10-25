@@ -213,6 +213,32 @@ class SafetyRegressionTest {
         assertEquals(false, invoke(bot, "shouldWithdraw", 100.0, true))
     }
 
+    @Test fun changedScreenAfterCoinClaimStopsBeforeTheLoopCanRetry() {
+        val ctx = MemoryContext()
+        val store = Store(ctx)
+        val phone = FakePhone()
+        val task = Task(true, 0.25, "領取", Pt(100, 200))
+        val room = Room("room", "", Task(), task, "", null, emptyMap(), "", null, null, null)
+        assertThrows(StopBot::class.java) {
+            invoke(Bot(phone, store, Settings(ctx), sleepFor = {}) {}, "claim", room)
+        }
+        assertEquals(1, phone.taps)
+        assertEquals(0, store.day.coinClaims)
+    }
+
+    @Test fun unknownWatchClaimStopsBeforeTheNextPanelAttempt() {
+        val ctx = MemoryContext()
+        val store = Store(ctx)
+        val phone = FakePhone().apply {
+            screen = Snap(listOf(node("", "待提領蝦幣數", 0), node("", "領取", 1)), SHOPEE, "")
+        }
+        assertThrows(StopBot::class.java) {
+            invoke(Bot(phone, store, Settings(ctx), sleepFor = {}) {}, "panelTasks", false)
+        }
+        assertEquals(1, phone.taps)
+        assertEquals(0.0, store.day.watchTotal, 0.0)
+    }
+
     @Test fun withdrawalMarkerIsDurableBeforeSubmitCanBeInterrupted() {
         val ctx = MemoryContext()
         val store = Store(ctx)

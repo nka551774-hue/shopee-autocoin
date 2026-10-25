@@ -25,12 +25,40 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(1, str(HERE.parent))
 
 import bot
+import probe
 import screens
 import serve
 import zxtouch
 from autocoin.config import Config
 from autocoin import state as state_module
 from autocoin.state import StateError, Store, TAIPEI
+
+
+class ProbeSafetyTests(unittest.TestCase):
+    def test_probe_rejects_existing_session_before_connecting(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            state = Store(root / "state-ios.json")
+            state.save()
+            original = state.path.read_bytes()
+            with state.exclusive(), patch.object(probe, "ROOT", root, create=True), \
+                    patch.object(sys, "argv", ["probe.py", "--tap", "1", "2"]), \
+                    patch.object(probe, "ZXTouch", side_effect=AssertionError("device connected")) as connect:
+                with self.assertRaises(StateError):
+                    probe.main()
+            connect.assert_not_called()
+            self.assertEqual(state.path.read_bytes(), original)
+
+    def test_malformed_amounts_and_options_are_rejected(self):
+        for text in ("-3.00", "3.001", "3.00.5", "9" * 400 + ".00"):
+            with self.subTest(text=text):
+                self.assertIsNone(screens.money(text))
+        shot = SimpleNamespace(lines=[screens.Line("提領數值", 100, 100),
+                                     screens.Line("立即提領", 100, 600)]
+                               + [screens.Line(text, 100, 200)
+                                  for text in ("-5.00", "1.5.00", "說5.00", "0.00")])
+        shot.find = lambda *keys: next((ln for ln in shot.lines if any(k in ln.text for k in keys)), None)
+        self.assertEqual(screens.read_withdraw(shot).options, [])
 
 
 class TriggerTests(unittest.TestCase):
@@ -127,6 +155,14 @@ class TriggerTests(unittest.TestCase):
 
 
 class ProcessTests(unittest.TestCase):
+    def test_foreground_launch_respects_existing_device_session(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with Store(root / "state-ios.json").exclusive(), patch.object(serve, "ROOT", root), \
+                    patch.object(zxtouch, "ZXTouch") as connect:
+                serve.bring_shopee_front()
+            connect.assert_not_called()
+
     def test_idle_controller_clears_old_stop_and_releases_state_lock_before_spawn(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -364,6 +400,28 @@ class BotTests(unittest.TestCase):
         self.shot.lines = []
         self.phone.shot.return_value = self.shot
 
+    def test_unknown_screen_cannot_dismiss_an_unrelated_rating_popup(self):
+        self.shot.lines = [screens.Line("稍後再說", 100, 300)]
+        self.bot.pause = Mock()
+        with patch.object(bot, "detect", return_value=screens.Screen.UNKNOWN):
+            self.assertEqual(self.bot.look()[0], screens.Screen.UNKNOWN)
+        self.phone.tap.assert_not_called()
+
+    def test_old_reward_notice_cannot_confirm_a_new_watch_claim(self):
+        self.shot.lines = [screens.Line("待提領蝦幣數", 100, 300)]
+        self.shot.find.return_value = screens.Line("0.21已發放至待提領蝦幣數", 100, 300)
+        self.bot.pause = Mock()
+        self.bot.capture = Mock()
+        self.bot.capture_once = Mock()
+        self.bot.look = Mock(return_value=(screens.Screen.PANEL, self.shot))
+        self.bot.back_to_room = Mock()
+        before = screens.Panel(pending=3, claim=(300, 500), claim_amount=.21)
+        with patch.object(bot, "read_panel", side_effect=[before, screens.Panel(pending=3)]):
+            with self.assertRaises(bot.StopBot):
+                self.bot.panel_tasks()
+        self.assertEqual(self.store.day.watch_total, 0)
+        self.phone.tap.assert_called_once_with(300, 500)
+
     def test_restarted_countdown_is_not_recorded_as_success(self):
         before = screens.Room(coin=screens.Task(present=True, claimable=True, button=(1, 2)))
         after = screens.Room(coin=screens.Task(present=True, state="05:00"))
@@ -453,6 +511,7 @@ class BotTests(unittest.TestCase):
         zx.screen_scale.return_value = 3
         zx.ocr.return_value = ([], [])
         with (patch.object(probe, "ZXTouch", return_value=zx), patch.object(probe.time, "sleep"),
+              patch.object(probe, "ROOT", Path(self.tmp.name)),
               patch("builtins.print"),
               patch.object(sys, "argv", ["probe.py", "--tap", "330", "500", "--swipe", "1", "2", "3", "4"])):
             self.assertEqual(probe.main(), 0)
@@ -484,7 +543,8 @@ class BotTests(unittest.TestCase):
         before = screens.Panel(pending=3, claim=(300, 500), claim_amount=0.21)
         after = screens.Panel(pending=3)
         with patch.object(bot, "read_panel", side_effect=[before, after]):
-            self.bot.panel_tasks()
+            with self.assertRaises(bot.StopBot):
+                self.bot.panel_tasks()
         self.assertEqual(self.store.day.watch_total, 0)
 
     def test_confirmed_watch_claim_counts_actual_balance_change(self):

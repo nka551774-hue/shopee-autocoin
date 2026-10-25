@@ -32,9 +32,10 @@ func clean(_ text: String) -> String {
 
 /// 「0·25」→ 0.25。small：金額只有個位數，前面多出來的數字是蝦幣圖示（「30·02」→ 0.02）。
 func money(_ text: String, small: Bool = false) -> Double? {
-    guard let m = groups(clean(text), #"(\d+)\.(\d{1,2})"#), m.count >= 2 else { return nil }
+    guard let m = groups(clean(text), #"(?<![\d.-])(\d+)\.(\d{1,2})(?![\d.])"#), m.count >= 2 else { return nil }
     let intPart = small ? String(m[0].suffix(1)) : m[0]
-    return Double(intPart + "." + m[1])
+    guard let amount = Double(intPart + "." + m[1]), amount.isFinite else { return nil }
+    return amount
 }
 
 /// 「04:36」→ 276 秒。冒號偶爾會漏掉（「0115」）。
@@ -156,9 +157,10 @@ enum Screen: String {
 }
 
 func detect(_ s: Shot) -> Screen {
-    if s.find("立即提領", "提領數值") != nil { return .withdraw }
+    let labels = Set(s.lines.filter { $0.y < CHAT_TOP }.map(\.text))
+    if !labels.isDisjoint(with: ["立即提領", "提領數值"]) { return .withdraw }
     // 直播間領取成功的提示也有「待提領蝦幣數」（「已發放至「待提領蝦幣數」中」），只認面板上那個標籤
-    if s.find("完成任務拿獎勵") != nil || s.lines.contains(where: { $0.text.hasSuffix("待提領蝦幣數") }) {
+    if !labels.isDisjoint(with: ["完成任務拿獎勵", "待提領蝦幣數"]) {
         return .panel
     }
     // OCR 偶爾會漏掉某一行，多看幾個地方：上方分頁列、直播主名稱下的人數、留言區、任務框
@@ -279,7 +281,7 @@ func read_withdraw(_ s: Shot) -> WithdrawPage {
     for ln in s.lines {
         if ln.y <= top.y || ln.y >= bottom.y { continue }
         if let label, ln.text == label.text { continue }
-        if let m = groups(clean(ln.text), #"(\d+)\.00$"#), let v = m.first, let amount = Int(v), amount > 0 {
+        if let m = groups(clean(ln.text), #"(\d+)\.00"#, anchored: true), let v = m.first, let amount = Int(v), amount > 0 {
             w.options.append((amount, CGPoint(x: ln.x, y: ln.y)))
         }
     }

@@ -254,7 +254,7 @@ class Bot:
         self._check_risk(s)
         # 系統的評分邀請（「喜歡「蝦皮購物」嗎？」）會蓋住整個畫面，提領完就跳出來過
         later = next((ln for ln in s.lines if ln.text in POPUP_DISMISS and ln.y < 560), None)
-        if later and not self.dry:
+        if later and not self.dry and detect(s) is not Screen.UNKNOWN:
             log.info("關掉彈出視窗（%s）", later.text)
             self.phone.tap(later.x, later.y)
             self.pause(1.5)
@@ -571,11 +571,12 @@ class Bot:
         p = read_panel(s)
         if p.claim:
             before = p.pending
+            previous_notice = s.find("已發放至")
             self.phone.tap(*p.claim)
             self.pause(1.5)
             s = self.phone.shot()
             self.check_messages(s)
-            confirmed = s.find("已發放至") is not None
+            confirmed = previous_notice is None and s.find("已發放至") is not None
             self.capture_once("panel-claimed", s)
             # 領完會跳出「0.21 蝦幣已發放至您的"待提領蝦幣數"」，提示還在的時候按別的都沒反應
             for _ in range(8):
@@ -584,6 +585,8 @@ class Bot:
                 self.pause(1)
                 s = self.phone.shot()
                 self.check_messages(s)
+            if detect(s) is not Screen.PANEL:
+                raise StopBot("觀看任務領取後畫面已改變，結果待確認")
             after = read_panel(s)
             delta = round(after.pending - before, 2) if before is not None and after.pending is not None else None
             confirmed = confirmed or (delta is not None and delta > 0)
@@ -593,8 +596,8 @@ class Bot:
                 day.watch_total = round(day.watch_total + (amount or 0.0), 2)
                 log.info("✔ 觀看任務 +%s（領進待提領）", f"{amount:.2f}" if amount is not None else "?")
             else:
-                log.warning("觀看任務領取結果未確認，不更新領取金額")
                 self.capture("panel-claim-unknown", s)
+                raise StopBot("觀看任務領取結果不明；停止以避免重複操作")
             p = after
         # 進度條下有「N分鐘」和終點的「90分鐘」兩個標籤；只剩一個 90 的話分不出是哪個，就不更新
         day = self.day

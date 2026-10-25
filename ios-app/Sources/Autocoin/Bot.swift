@@ -457,7 +457,7 @@ final class Bot {
     /// 開任務獎勵面板：把觀看任務的蝦幣領進待提領，需要時提領。
     /// 直播間會縮成右下角浮窗，倒數不受影響。
     private func panelTasks(final: Bool = false) throws {
-        let d = day
+        var d = day
         d.lastPanel = Date().timeIntervalSince1970
         store.save()
         var l = try look()
@@ -478,6 +478,7 @@ final class Bot {
         }
         try pause(1500)  // 等畫面載完
         var s = try snapshot()
+        guard detect(s) == .panel else { throw StopBot(message: "任務面板已改變，停止使用舊畫面") }
         var p = read_panel(s)
         if let c = p.claim {
             let before = p.pending
@@ -493,6 +494,7 @@ final class Bot {
                 try pause(1000)
                 s = try snapshot()
             }
+            guard detect(s) == .panel else { throw StopBot(message: "觀看任務領取後畫面已改變，結果待確認") }
             let after = read_panel(s)
             let increase: Double? = before.flatMap { b in after.pending.map { round2($0 - b) } }
             guard notice != nil || (increase ?? 0) > 0 else {
@@ -500,12 +502,15 @@ final class Bot {
                 throw StopBot(message: "觀看任務領取結果不明，未計入成功")
             }
             let amount = (increase ?? 0) > 0 ? increase : notice.flatMap { money($0.text) } ?? p.claimAmount
+            d = day
             d.watchTotal = round2(d.watchTotal + (amount ?? 0))
             let shown = amount.map { String(format: "%.2f", $0) } ?? "?"
             Log.shared.i("✔ 觀看任務 +\(shown)（領進待提領）")
             p = after
         }
         // 進度條下有「N分鐘」和終點的「90分鐘」兩個標籤；只剩一個 90 的話分不出是哪個，就不更新
+        d = day
+        d.lastPanel = Date().timeIntervalSince1970
         if p.minutes.count >= 2 || (p.minutes.first != nil && p.minutes[0] != 90) {
             d.watchMinutes = p.minutes[0]
         }
@@ -514,7 +519,7 @@ final class Bot {
         store.save()
         Log.shared.i(String(format: "待提領 %.2f｜觀看任務 %d/90 分鐘", d.pending, d.watchMinutes))
         if let pending = p.pending, shouldWithdraw(pending, final: final) {
-            try withdraw(p)
+            try withdraw()
         }
         let back = try look()
         _ = try backToRoom(back.0, back.1)
@@ -522,7 +527,7 @@ final class Bot {
 
     private func shouldWithdraw(_ pending: Double, final: Bool) -> Bool {
         let d = day
-        if !cfg.withdraw || d.withdrawalPending || d.withdrawals >= cfg.withdrawDailyLimit || pending < 1 { return false }
+        if !cfg.withdraw || d.withdrawalPending || d.withdrawals >= cfg.withdrawDailyLimit || !pending.isFinite || pending < 1 { return false }
         let now = Date()
         let cal = Store.rewardCalendar
         let late = cal.component(.hour, from: now) == 23 && cal.component(.minute, from: now) >= 40
@@ -530,16 +535,18 @@ final class Bot {
     }
 
     /// 在面板按「提領」，選不超過待提領的最大面額，送出並確認待提領有變少。
-    private func withdraw(_ panel: Panel) throws {
-        let d = day
+    private func withdraw() throws {
+        var d = day
         guard !d.withdrawalPending else { throw StopBot(message: "先前提領仍待確認，請核對帳戶") }
-        guard let withdrawButton = panel.withdraw else {
-            Log.shared.w("面板上找不到「提領」")
-            return
-        }
+        guard cfg.withdraw, d.withdrawals < cfg.withdrawDailyLimit else { return }
         var scr = Screen.panel
         var s = try snapshot()
         for _ in 0..<2 {   // 剛關掉的提示有時會吃掉第一下
+            guard detect(s) == .panel else { throw StopBot(message: "任務面板已改變，取消開啟提領") }
+            guard let withdrawButton = read_panel(s).withdraw else {
+                Log.shared.w("目前面板上找不到「提領」")
+                return
+            }
             try phone.tap(withdrawButton)
             let r = try waitFor([.withdraw], timeout: 6)
             scr = r.0
@@ -552,8 +559,12 @@ final class Bot {
             return
         }
         try pause(1000)
-        var w = read_withdraw(try snapshot())
-        guard let pending = w.pending else { throw StopBot(message: "無法讀取目前待提領餘額，停止提領") }
+        s = try snapshot()
+        guard detect(s) == .withdraw else { throw StopBot(message: "提領頁已改變，取消選擇金額") }
+        var w = read_withdraw(s)
+        guard let pending = w.pending, pending.isFinite, pending >= 0 else {
+            throw StopBot(message: "無法讀取目前待提領餘額，停止提領")
+        }
         let options = w.options.filter { $0.0 > 0 && Double($0.0) <= pending }
         guard let (amount, pos) = options.max(by: { $0.0 < $1.0 }) else {
             Log.shared.i(String(format: "待提領 %.2f，沒有能選的提領金額", pending))
@@ -565,6 +576,10 @@ final class Bot {
         try pause(1000)
         s = try snapshot()
         w = read_withdraw(s)
+        guard detect(s) == .withdraw, let latestPending = w.pending, latestPending.isFinite,
+              abs(latestPending - pending) <= 0.009, w.options.contains(where: { $0.0 == amount }) else {
+            throw StopBot(message: "提領頁、餘額或面額已改變，取消送出")
+        }
         guard let submit = w.submit else {
             Log.shared.w("找不到「立即提領」")
             try phone.back()
@@ -572,9 +587,13 @@ final class Bot {
             return
         }
         captureOnce("withdraw-selected", s)
+        d = day
+        guard cfg.withdraw, !d.withdrawalPending, d.withdrawals < cfg.withdrawDailyLimit else {
+            throw StopBot(message: "目前的提領設定或額度不允許送出")
+        }
         d.withdrawalPending = true
         store.save()
-        try store.checkHealth()
+        try ensureRunning()
         try phone.tap(submit)
         var done = false
         var confirmed = false
@@ -584,12 +603,6 @@ final class Bot {
             scr = r.0
             s = r.1
             if i == 1 { captureOnce("withdraw-submitted", s) }
-            if !confirmed, scr == .withdraw,
-               let confirm = s.lines.first(where: { $0.text == "確認提領" }) {
-                try phone.tap(confirm.x, confirm.y)
-                confirmed = true
-                continue
-            }
             // 每天只能提領 3 次；手動提領過的話程式的計數會少算，看到上限提示就當作今天用完
             // （只看提領頁和面板，直播間的宣傳圖上常有「上限」之類的字）
             if let limit = s.lines.first(where: { ln in
@@ -597,11 +610,18 @@ final class Bot {
                     && ["已達", "已超過", "已用完", "不能再"].contains(where: { ln.text.contains($0) })
             })?.text {
                 Log.shared.i("提領被拒：\(limit)，今天不再提領")
+                d = day
                 d.withdrawals = cfg.withdrawDailyLimit
                 d.withdrawalPending = false
                 store.save()
                 done = true
                 break
+            }
+            if !confirmed, scr == .withdraw,
+               let confirm = s.lines.first(where: { $0.text == "確認提領" }) {
+                try phone.tap(confirm.x, confirm.y)
+                confirmed = true
+                continue
             }
             var after: Double?
             if scr == .withdraw {
@@ -609,10 +629,11 @@ final class Bot {
             } else if scr == .panel {
                 after = read_panel(s).pending
             }
-            if s.find("提領成功") != nil && after == nil {
+            if (scr == .withdraw || scr == .panel) && s.find("提領成功") != nil && after == nil {
                 after = round2(pending - Double(amount))
             }
             if let a = after, abs(a - (pending - Double(amount))) <= 0.01 {
+                d = day
                 d.withdrawals += 1
                 d.withdrawn += Double(amount)
                 d.pending = a
@@ -689,18 +710,23 @@ final class Bot {
     }
 
     private func restUntilTomorrow() throws {
-        let d = day
+        var d = day
+        let completedDate = d.date
         if !d.finalPanel {
             _ = try goRoom()
             try panelTasks(final: true)
+            d = day
+            if d.date != completedDate { return }
             d.finalPanel = true
             store.save()
         }
         Log.shared.i("今天能領的都領完了，休息到明天：" + store.summary())
         status("今天領完了，明天再來")
         let cal = Store.rewardCalendar
-        let wake = cal.date(byAdding: DateComponents(day: 1, hour: 0, minute: 3),
-                            to: cal.startOfDay(for: Date())) ?? Date().addingTimeInterval(86_400)
+        guard let start = ISO8601DateFormatter().date(from: completedDate + "T00:03:00+08:00"),
+              let wake = cal.date(byAdding: .day, value: 1, to: start) else {
+            throw StopBot(message: "無法判斷下一個獎勵日，請校正日期")
+        }
         while Date() < wake && !timeUp() {
             try pause(min(300_000, max(1000, wake.timeIntervalSince(Date()) * 1000)))
         }

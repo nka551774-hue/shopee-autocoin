@@ -27,10 +27,11 @@ def clean(text: str) -> str:
 
 def money(text: str, small: bool = False) -> float | None:
     """「0·25」→ 0.25。small：金額只有個位數，前面多出來的數字是蝦幣圖示（「30·02」→ 0.02）。"""
-    m = re.search(r"(?<![\d.-])(\d+)\.(\d{1,2})(?!\d)", clean(text))
+    m = re.search(r"(?<![\d.-])(\d+)\.(\d{1,2})(?![\d.])", clean(text))
     if not m:
         return None
-    return float(f"{m[1][-1:] if small else m[1]}.{m[2]}")
+    amount = float(f"{m[1][-1:] if small else m[1]}.{m[2]}")
+    return amount if math.isfinite(amount) else None
 
 
 def countdown(text: str) -> int | None:
@@ -258,7 +259,7 @@ def read_withdraw(s: Shot) -> WithdrawPage:
     for ln in s.lines:
         if top and ln.y <= top.y or bottom and ln.y >= bottom.y or ln is label:
             continue
-        m = re.search(r"(\d+)\.00$", clean(ln.text))
-        if m:
+        m = re.fullmatch(r"(\d+)\.00", clean(ln.text))
+        if m and int(m[1]) > 0:
             w.options.append((int(m[1]), (ln.x, ln.y)))
     return w

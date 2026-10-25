@@ -2,6 +2,25 @@
 
 日期：2026-10-25（Asia/Taipei）。基準版本：`f421c31`。範圍包含 `autocoin/`、`android/`、`ios/`、原有但尚未追蹤的 `ios-jb/` 與 `ios-app/`，以及 GitHub Actions。
 
+## 第三輪完整逐檔複查（2026-10-25，基準 `c5edbec`）
+
+本輪列出並核對全部 74 個基準追蹤檔：71 個 first-party 文字檔完整閱讀，3 個 Gradle 生成／第三方檔案另列供應鏈與二進位限制。每檔結論、缺陷重現、實際命令、JDK／SDK／ASCII 建置路徑與未覆蓋項見 [逐檔審查紀錄](docs/reviews/round3-file-review.md)。沒有以檔名搜尋代替內容審查。
+
+新增修復：
+
+- 5 個 iOS 探索／測試 CLI 與越獄控制器的切前景操作，現在於建立裝置連線前取得共用 `state-ios.json` 排他鎖；鎖衝突無裝置動作，操作例外後會釋放鎖。
+- iOS 面板／提領辨識只接受聊天區上方的完整標籤；兩種 Python iOS 版本拒絕負數、小數前綴、溢位金額，以及帶負號或文字前綴的提領面額。
+- Android 領取後畫面不明、領取逾時或觀看任務未確認時停止，不回主迴圈重複點擊。越獄版也不再將舊獎勵通知當成新領取成功，領取後重新辨識面板；未知 App 的「稍後再說」不再觸控。
+- Swift 實驗來源同步修正上述辨識、面板／提領前重新驗證、拒絕先於確認、未知頁成功提示、跨午夜狀態與收尾喚醒日。主代理複審再補上提領入口：每次點擊前確認最新面板並重新解析座標。
+
+Python／Android 缺陷均有原碼失敗與修正版通過的證據；Android 新觀看測試最初誤用 iOS 標籤，已修 fixture 並在基準 Bot.kt 上重跑出 2 個失敗，才以最終修正版驗證。Swift 沒有編譯器與完整 Apple 工程，**僅靜態審查及 tree-sitter 語法通過，沒有 Swift red/green runtime 證據**。
+
+最終重新驗證：pytest **77**、iOS unittest **47**、ios-jb unittest **55**、Android JVM **35**，合計 **214 項回歸測試通過**；另有 **36 項 loopback 檢查**。Ruff、`pip check`、`pip-audit`、`git diff --check` 通過；Swift 7 檔語法無 error。
+
+Android `testDebugUnitTest lintDebug assembleDebug` 成功，JVM 0 failures／errors／skipped，Lint 0 issue；22 個追蹤 Android 檔案與建置副本 SHA-256 完全一致。APK SHA-256：`9EE47DC91BA3B9EF5810D3F57B78E8D800E0165C66720B2922B563DC25E89D43`。原有 Gradle 10 相容性棄用警告保留。
+
+未連真實手機、未領取或提領、未安裝 APK；沒有本輪效能量測或新倍數宣稱。Swift 的 Apple SDK 型別檢查／連結／執行與外部手機 UI 仍未驗證，詳見逐檔報告的限制。
+
 ## 第二輪故障路徑複查（2026-10-25，基準 `bec2151`）
 
 本輪追查停止／重啟、跨程序所有權、TCP 回應完整性、持久化配額與排程邊界。以下修復先新增回歸並觀察原碼失敗，再修改正式路徑；新增 12 個測試，其中 11 個為失敗重現（含參數化共 15 個失敗案例），另 1 個驗證正常啟動仍可清除舊停止旗標，且啟動子程序前已釋放狀態鎖。

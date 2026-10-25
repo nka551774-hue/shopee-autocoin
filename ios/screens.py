@@ -6,6 +6,7 @@ iOS 讀不到元件樹（XCUIApplication 會讓 TouchSynthesis 卡死），只�
 from __future__ import annotations
 
 import io
+import math
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -39,10 +40,11 @@ def clean(text: str) -> str:
 
 def money(text: str, small: bool = False) -> float | None:
     """「0·25」→ 0.25。small：金額只有個位數，前面多出來的數字是蝦幣圖示（「30·02」→ 0.02）。"""
-    m = re.search(r"(\d+)\.(\d{1,2})", clean(text))
+    m = re.search(r"(?<![\d.-])(\d+)\.(\d{1,2})(?![\d.])", clean(text))
     if not m:
         return None
-    return float(f"{m[1][-1:] if small else m[1]}.{m[2]}")
+    amount = float(f"{m[1][-1:] if small else m[1]}.{m[2]}")
+    return amount if math.isfinite(amount) else None
 
 
 def countdown(text: str) -> int | None:
@@ -106,10 +108,11 @@ class Screen(str, Enum):
 
 
 def detect(s: Shot) -> Screen:
-    if s.find("立即提領", "提領數值"):
+    labels = {ln.text for ln in s.lines if ln.y < CHAT_TOP}
+    if labels & {"立即提領", "提領數值"}:
         return Screen.WITHDRAW
     # 直播間領取成功的提示也有「待提領蝦幣數」（「已發放至「待提領蝦幣數」中」），只認面板上那個標籤
-    if s.find("完成任務拿獎勵") or any(ln.text.endswith("待提領蝦幣數") for ln in s.lines):
+    if labels & {"完成任務拿獎勵", "待提領蝦幣數"}:
         return Screen.PANEL
     # OCR 偶爾會漏掉某一行，多看幾個地方：上方分頁列、直播主名稱下的人數、留言區、任務框
     tabs = [ln for ln in s.lines if ln.y < 90]
@@ -232,7 +235,7 @@ def read_withdraw(s: Shot) -> WithdrawPage:
     for ln in s.lines:
         if top and ln.y <= top.y or bottom and ln.y >= bottom.y or ln is label:
             continue
-        m = re.search(r"(\d+)\.00$", clean(ln.text))
+        m = re.fullmatch(r"(\d+)\.00", clean(ln.text))
         if m and int(m[1]) > 0:
             w.options.append((int(m[1]), (ln.x, ln.y)))
     return w

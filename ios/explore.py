@@ -11,6 +11,12 @@ from __future__ import annotations
 import io
 import sys
 import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from autocoin.state import Store  # noqa: E402
 
 from PIL import Image
 
@@ -20,6 +26,11 @@ OUT = "D:/tmp/ios"
 
 
 def main():
+    with Store(ROOT / "state-ios.json").exclusive():
+        return run_session()
+
+
+def run_session():
     sys.stdout.reconfigure(encoding="utf-8")
     name, *steps = sys.argv[1:]
     ts = TouchSynthesis(timeout=40)

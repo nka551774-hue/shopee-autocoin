@@ -15,12 +15,15 @@ from unittest.mock import AsyncMock, Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import bot
+import claim_test
+import explore
 import ocr
+import scan_rooms
 import screens
 import tsclient
 from autocoin.config import Config
 from autocoin import state as state_module
-from autocoin.state import Store, TAIPEI
+from autocoin.state import StateError, Store, TAIPEI
 from PIL import Image
 
 
@@ -442,6 +445,26 @@ class BotSafetyTests(unittest.TestCase):
 
 
 class ScreenTests(unittest.TestCase):
+    def test_chat_or_embedded_labels_cannot_trigger_panel_navigation(self):
+        for text, y in (("立即提領", 620), ("完成任務拿獎勵", 620),
+                        ("待提領蝦幣數", 620), ("觀眾說立即提領", 200)):
+            with self.subTest(text=text, y=y):
+                shot = FakeShot()
+                shot.lines = [ocr.Line(text, [ocr.Word(text, 100, y, 10, 10)])]
+                self.assertEqual(screens.detect(shot), screens.Screen.UNKNOWN)
+
+    def test_malformed_amounts_are_not_positive_balances(self):
+        for text in ("-3.00", "3.001", "3.00.5", "9" * 400 + ".00"):
+            with self.subTest(text=text):
+                self.assertIsNone(screens.money(text))
+        self.assertEqual(screens.money("待提領蝦幣數: 3·00"), 3)
+
+    def test_withdraw_options_require_complete_positive_amounts(self):
+        shot = withdraw_shot()
+        shot.lines[1:2] = [ocr.Line(text, [ocr.Word(text, 5, 200, 10, 10)])
+                           for text in ("-5.00", "1.5.00", "說5.00", "0.00")]
+        self.assertEqual(screens.read_withdraw(shot).options, [])
+
     def test_native_bitmap_is_closed_even_when_ocr_fails(self):
         bitmap = Mock()
         with patch.object(ocr, "_get_engine"), patch.object(ocr, "_bitmap", return_value=bitmap), \
@@ -473,6 +496,43 @@ class ScreenTests(unittest.TestCase):
         shot.box = []
         shot.name = "test"
         self.assertEqual(screens.read_room(shot).claimed, "")
+
+
+class HelperLockTests(unittest.TestCase):
+    def test_helpers_hold_lock_through_action_and_release_it_after_error(self):
+        for module in (claim_test, explore, scan_rooms, tsclient):
+            with self.subTest(module=module.__name__), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+
+                def action():
+                    with self.assertRaises(StateError):
+                        with Store(root / "state-ios.json").exclusive():
+                            self.fail("another session acquired the lock during an action")
+                    raise ValueError("action failed")
+
+                with patch.object(module, "ROOT", root), patch.object(module, "run_session", side_effect=action):
+                    with self.assertRaisesRegex(ValueError, "action failed"):
+                        module.main()
+                with Store(root / "state-ios.json").exclusive():
+                    pass
+
+    def test_helpers_reject_existing_session_before_connecting(self):
+        for module, argv in ((claim_test, ["claim_test.py", "1"]),
+                             (explore, ["explore.py", "test", "tap:1,2"]),
+                             (scan_rooms, ["scan_rooms.py", "1"]),
+                             (tsclient, ["tsclient.py", "tap", "1", "2"])):
+            with self.subTest(module=module.__name__), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                state = Store(root / "state-ios.json")
+                state.save()
+                original = state.path.read_bytes()
+                with state.exclusive(), patch.object(module, "ROOT", root, create=True), \
+                        patch.object(sys, "argv", argv), patch.object(sys, "stdout", Mock()), \
+                        patch.object(module, "TouchSynthesis", side_effect=AssertionError("device connected")) as connect:
+                    with self.assertRaises(StateError):
+                        module.main()
+                connect.assert_not_called()
+                self.assertEqual(state.path.read_bytes(), original)
 
 
 if __name__ == "__main__":

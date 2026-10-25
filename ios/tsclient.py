@@ -22,6 +22,12 @@ import time
 import threading
 import uuid
 from contextlib import contextmanager
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from autocoin.state import Store  # noqa: E402
 
 
 class ProtocolError(RuntimeError):
@@ -165,18 +171,29 @@ class TouchSynthesis:
                         return data
 
 
-if __name__ == "__main__":
+def main():
+    with Store(ROOT / "state-ios.json").exclusive():
+        return run_session()
+
+
+def run_session():
     sys.stdout.reconfigure(encoding="utf-8")
-    ts = TouchSynthesis()
     cmd, *args = sys.argv[1:]
-    if cmd == "shot":
-        data = ts.grab()
-        open(args[0] if args else "shot.png", "wb").write(data)
-        print(f"{len(data)} bytes")
-    elif cmd == "tap":
-        ts.tap(float(args[0]), float(args[1]))
-    elif cmd == "swipe":
-        ts.swipe(*map(float, args[:4]))
-    elif cmd == "home":
-        ts.press_home()
-    ts.close()
+    ts = TouchSynthesis()
+    try:
+        if cmd == "shot":
+            data = ts.grab()
+            Path(args[0] if args else "shot.png").write_bytes(data)
+            print(f"{len(data)} bytes")
+        elif cmd == "tap":
+            ts.tap(float(args[0]), float(args[1]))
+        elif cmd == "swipe":
+            ts.swipe(*map(float, args[:4]))
+        elif cmd == "home":
+            ts.press_home()
+    finally:
+        ts.close()
+
+
+if __name__ == "__main__":
+    main()

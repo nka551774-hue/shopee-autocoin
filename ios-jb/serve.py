@@ -130,11 +130,14 @@ def bring_shopee_front():
     """用 tweak 的 task 11 把蝦皮叫回前景，省掉使用者自己切回去的那一下。"""
     try:
         from zxtouch import ZXTouch
-        zx = ZXTouch("127.0.0.1", 6000, timeout=5)
-        try:
-            zx.foreground(SHOPEE)
-        finally:
-            zx.close()
+        with Store(ROOT / "state-ios.json").exclusive():
+            if _cancel_start.is_set():
+                return
+            zx = ZXTouch("127.0.0.1", 6000, timeout=5)
+            try:
+                zx.foreground(SHOPEE)
+            finally:
+                zx.close()
     except Exception as e:  # 沒有 tweak 也要能跑（只是要自己切回蝦皮）
         print(f"叫不回蝦皮：{e}", file=sys.stderr)
 

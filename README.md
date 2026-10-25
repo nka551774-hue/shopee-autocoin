@@ -18,6 +18,7 @@
 研究過程與畫面元件的細節在 [RESEARCH.md](RESEARCH.md)。
 
 2026-10-25 的漏洞修正、效能量測、驗證方式及剩餘限制見 [AUDIT.md](AUDIT.md)。
+第三輪的逐檔覆蓋與重跑環境見 [完整檔案審查紀錄](docs/reviews/round3-file-review.md)。
 `ios-app/` 是尚未有完整建置專案的 Swift 原始碼，狀態見 [ios-app/README.md](ios-app/README.md)。
 
 ## 它會做什麼
@@ -102,6 +103,7 @@ $env:TS_HOST = "192.168.31.196"                 # 手機的 IP
 - 開不了 App。畫面認不得時會等待你把手機切回蝦皮直播間；返回操作只用於已辨識的面板。
 - 等待與點擊沒有抖動。
 - 統計存在 `state-ios.json`（iOS 跟 Android 是不同的蝦皮帳號），紀錄檔在 `logs/ios.log`，沒看過的畫面存在 `logs/captures-ios/`。
+- `claim_test.py`、`explore.py`、`scan_rooms.py` 與 `tsclient.py` 的 CLI 也會持有同一份裝置操作鎖；使用前先停止 bot，鎖檔不需要刪除。
 
 ## iOS 越獄版（ios-jb/）
 
