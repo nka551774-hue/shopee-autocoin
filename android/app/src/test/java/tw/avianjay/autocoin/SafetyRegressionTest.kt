@@ -253,6 +253,138 @@ class SafetyRegressionTest {
         assertSame(first, snap.id("same"))
     }
 
+    @Test fun trustedTextIndexIgnoresChatControlsAndKeepsFirstRealMatch() {
+        val chat = node("public_screen_view", "", 0).apply { end = 3 }
+        val fakeSubmit = node("", "立即提領", 1)
+        val fakeBalance = node("", "待提領蝦幣數:50", 2)
+        val safe = Snap(listOf(chat, fakeSubmit, fakeBalance), SHOPEE, "")
+        assertNull(safe.text("立即提領"))
+        assertEquals(Screen.UNKNOWN, detect(safe))
+        val ctx = MemoryContext()
+        val bot = Bot(FakePhone(), Store(ctx), Settings(ctx)) {}
+        assertNull(invoke(bot, "pendingAmount", safe))
+        assertNull(invoke(bot, "pendingAmount", Snap(listOf(node("", "待提領蝦幣數:-5", 0)), SHOPEE, "")))
+        val first = node("", "立即提領", 3)
+        val both = Snap(listOf(chat, fakeSubmit, fakeBalance, first, node("", "立即提領", 4)), SHOPEE, "")
+        assertSame(first, both.text("立即提領"))
+        assertSame(first, both.text("立即提領"))
+    }
+
+    @Test fun nonfiniteBalanceCannotRequestWithdrawal() {
+        val ctx = MemoryContext()
+        val bot = Bot(FakePhone(), Store(ctx), Settings(ctx)) {}
+        for (value in listOf(Double.NaN, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY)) {
+            assertEquals(false, invoke(bot, "shouldWithdraw", value, true))
+        }
+    }
+
+    @Test fun missingLatestBalanceCannotFallBackToEarlierPage() {
+        val ctx = MemoryContext()
+        val store = Store(ctx)
+        val phone = FakePhone().apply { screens.addAll(listOf(withdrawPage(), withdrawPage(null))) }
+        invoke(Bot(phone, store, Settings(ctx), sleepFor = {}) {}, "withdraw", withdrawPanel())
+        assertEquals(1, phone.taps)
+        assertFalse(store.day.withdrawalUncertain)
+    }
+
+    @Test fun changedBalanceOrDenominationBlocksSubmit() {
+        for (changed in listOf(withdrawPage(15.0), withdrawPage(null), withdrawPage(10.0, enabled = false))) {
+            val ctx = MemoryContext()
+            val store = Store(ctx)
+            val phone = FakePhone().apply { screens.addAll(listOf(withdrawPage(), withdrawPage(), changed)) }
+            val bot = Bot(phone, store, Settings(ctx), sleepFor = {}) {}
+            assertThrows(StopBot::class.java) { invoke(bot, "withdraw", withdrawPanel()) }
+            assertEquals(2, phone.taps)
+            assertFalse(store.day.withdrawalUncertain)
+        }
+    }
+
+    @Test fun changedLimitOrSettingBlocksSubmit() {
+        for (disable in listOf(false, true)) {
+            val ctx = MemoryContext()
+            val store = Store(ctx)
+            val cfg = Settings(ctx)
+            val phone = FakePhone().apply {
+                screen = withdrawPage()
+                onTap = { if (it == 2) { if (disable) cfg.withdraw = false else store.day.withdrawals = 3 } }
+            }
+            assertThrows(StopBot::class.java) {
+                invoke(Bot(phone, store, cfg, sleepFor = {}) {}, "withdraw", withdrawPanel())
+            }
+            assertEquals(2, phone.taps)
+            assertFalse(store.day.withdrawalUncertain)
+        }
+    }
+
+    @Test fun untrustedOrInexactResultCannotClearWithdrawalJournal() {
+        val unknown = Snap(listOf(node("", "待提領蝦幣數:5.00", 0)), SHOPEE, "")
+        for (after in listOf(unknown, withdrawPage(0.0), withdrawPage(extra = listOf("每日提領上限三次", "確認")))) {
+            val ctx = MemoryContext()
+            val store = Store(ctx)
+            val phone = FakePhone().apply { screens.addAll(listOf(withdrawPage(), withdrawPage(), withdrawPage(), after)) }
+            invoke(Bot(phone, store, Settings(ctx), sleepFor = {}) {}, "withdraw", withdrawPanel())
+            assertTrue(Store(ctx).day.withdrawalUncertain)
+            assertEquals(0, store.day.withdrawals)
+            assertEquals(3, phone.taps)
+            if (after === unknown) assertEquals(0, phone.backs)
+        }
+    }
+
+    @Test fun explicitConfirmationIsOnlySentOnce() {
+        val ctx = MemoryContext()
+        val store = Store(ctx)
+        val phone = FakePhone().apply {
+            screens.addAll(listOf(withdrawPage(), withdrawPage(), withdrawPage(), withdrawPage(extra = listOf("確認提領"))))
+        }
+        invoke(Bot(phone, store, Settings(ctx), sleepFor = {}) {}, "withdraw", withdrawPanel())
+        assertEquals(4, phone.taps)
+        assertTrue(Store(ctx).day.withdrawalUncertain)
+    }
+
+    @Test fun rejectionWinsOverConfirmationButton() {
+        val ctx = MemoryContext()
+        val store = Store(ctx)
+        val phone = FakePhone().apply {
+            screens.addAll(listOf(withdrawPage(), withdrawPage(), withdrawPage(),
+                withdrawPage(extra = listOf("確認提領", "已達每日提領上限"))))
+        }
+        invoke(Bot(phone, store, Settings(ctx), sleepFor = {}) {}, "withdraw", withdrawPanel())
+        assertEquals(3, phone.taps)
+        assertEquals(3, store.day.withdrawals)
+        assertFalse(Store(ctx).day.withdrawalUncertain)
+    }
+
+    @Test fun withdrawalCrossingMidnightPersistsAndUpdatesLiveDay() {
+        for (rolloverAt in listOf(2, 3)) {
+            val ctx = MemoryContext()
+            var date = LocalDate.of(2026, 10, 25)
+            val store = Store(ctx) { date }
+            val phone = FakePhone().apply {
+                screens.addAll(listOf(withdrawPage(), withdrawPage(), withdrawPage(), withdrawPage(5.0)))
+                onTap = { tap ->
+                    if (tap == 3) assertTrue(Store(ctx) { date }.day.withdrawalUncertain)
+                    if (tap == rolloverAt) { date = date.plusDays(1); store.day }
+                }
+            }
+            invoke(Bot(phone, store, Settings(ctx), sleepFor = {}) {}, "withdraw", withdrawPanel())
+            val saved = Store(ctx) { date }.day
+            assertEquals("2026-10-26", saved.date)
+            assertEquals(1, saved.withdrawals)
+            assertEquals(5.0, saved.withdrawn, 0.0)
+            assertFalse(saved.withdrawalUncertain)
+        }
+    }
+
+    private fun withdrawPanel() = Snap(listOf(node("", "提領", 0)), SHOPEE, "")
+
+    private fun withdrawPage(pending: Double? = 10.0, extra: List<String> = emptyList(), enabled: Boolean = true): Snap {
+        val nodes = mutableListOf(node("", "立即提領", 0))
+        if (pending != null) nodes.add(node("", "待提領蝦幣數:$pending", nodes.size))
+        nodes.add(N("", "5.00", "", Rect(), false, nodes.size, enabled))
+        for (text in extra) nodes.add(node("", text, nodes.size))
+        return Snap(nodes, SHOPEE, "")
+    }
+
     private fun node(rid: String, text: String, index: Int) = N(rid, text, "", Rect(), false, index)
 
     private fun invoke(target: Any, name: String, vararg args: Any): Any? {
@@ -271,8 +403,13 @@ class SafetyRegressionTest {
         var launches = 0
         var backs = 0
         var interruptAtTap = -1
-        override fun snapshot(): Snap { reads++; return screen }
-        override fun tap(p: Pt) { if (++taps == interruptAtTap) throw InterruptedException("test cancellation") }
+        val screens = ArrayDeque<Snap>()
+        var onTap: (Int) -> Unit = {}
+        override fun snapshot(): Snap { reads++; if (screens.isNotEmpty()) screen = screens.removeFirst(); return screen }
+        override fun tap(p: Pt) {
+            if (++taps == interruptAtTap) throw InterruptedException("test cancellation")
+            onTap(taps)
+        }
         override fun swipe(x1: Int, y1: Int, x2: Int, y2: Int, ms: Long) {}
         override fun back() { backs++ }
         override fun foreground() = screen.pkg

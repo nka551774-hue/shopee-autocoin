@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import io
 import json
+from datetime import datetime, timedelta
 from pathlib import Path
 import struct
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -17,7 +19,8 @@ import ocr
 import screens
 import tsclient
 from autocoin.config import Config
-from autocoin.state import Store
+from autocoin import state as state_module
+from autocoin.state import Store, TAIPEI
 from PIL import Image
 
 
@@ -92,6 +95,82 @@ class TransportTests(unittest.TestCase):
             self.client(sock).screenshot()
         self.assertTrue(sock.closed)
 
+    def test_mismatched_reply_id_closes_connection_without_replay(self):
+        sock = FakeSocket(lambda _: {"id": "another-command", "success": True})
+        with self.assertRaises(tsclient.ProtocolError):
+            self.client(sock).call("tap")
+        self.assertTrue(sock.closed)
+        self.assertEqual(len(sock.sent), 1)
+
+    def test_malformed_tree_payload_closes_connection(self):
+        for payload in (None, "not json", "[]", {}):
+            with self.subTest(payload=payload):
+                sock = FakeSocket(lambda cmd: {"id": cmd["id"], "success": True, "data": payload})
+                with self.assertRaises(tsclient.ProtocolError):
+                    self.client(sock).tree("test.app")
+                self.assertTrue(sock.closed)
+
+    def test_queue_timeout_does_not_close_another_commands_socket(self):
+        sock = FakeSocket()
+        client = self.client(sock)
+        client.timeout = .02
+        acquired, release = threading.Event(), threading.Event()
+
+        def hold_lock():
+            with client._lock:
+                acquired.set()
+                release.wait(5)
+
+        worker = threading.Thread(target=hold_lock)
+        worker.start()
+        try:
+            self.assertTrue(acquired.wait(2))
+            with self.assertRaises(TimeoutError):
+                client.call("tap")
+            self.assertFalse(sock.closed)
+            self.assertEqual(sock.sent, [])
+        finally:
+            release.set()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(client.call("tap")["success"])
+
+    def test_queue_wait_counts_toward_command_deadline(self):
+        sock = FakeSocket()
+        client = self.client(sock)
+        client._lock = Mock()
+        with patch.object(tsclient.time, "monotonic", side_effect=[0, 1.1]):
+            with self.assertRaises(TimeoutError):
+                client.call("tap")
+        self.assertEqual(sock.sent, [])
+        self.assertTrue(sock.closed)
+        client._lock.acquire.assert_called_once_with(timeout=1)
+        client._lock.release.assert_called_once()
+
+    def test_stream_grab_skips_old_frame_and_stops_once(self):
+        sock = FakeSocket()
+        send = sock.sendall
+
+        def stream_send(payload):
+            send(payload)
+            if json.loads(payload[4:])["action"] == "startStream":
+                for frame in (b"\xffold", b"\xffnew"):
+                    sock.buffer.extend(struct.pack(">I", len(frame)) + frame)
+
+        sock.sendall = stream_send
+        self.assertEqual(self.client(sock).grab(skip=1), b"\xffnew")
+        self.assertEqual([cmd["action"] for cmd in sock.sent], ["startStream", "stopStream"])
+        self.assertFalse(sock.closed)
+
+    def test_touch_connection_failure_does_not_retry_stale_coordinates(self):
+        phone = bot.Phone("test.invalid")
+        with patch.object(bot, "TouchSynthesis", side_effect=ConnectionRefusedError) as connect, \
+                patch.object(bot.time, "sleep") as sleep:
+            with self.assertRaises(bot.StopBot):
+                phone.tap(1, 2)
+        connect.assert_called_once()
+        sleep.assert_not_called()
+
     def test_touch_is_never_replayed_after_lost_acknowledgement(self):
         connection = Mock()
         connection.tap.side_effect = ConnectionResetError("reply lost")
@@ -108,12 +187,26 @@ class FakeShot:
     def __init__(self, texts=()):
         self.lines = [ocr.Line(text, [ocr.Word(text, 100, 200, 10, 10)]) for text in texts]
         self.data = b"offline"
+        self.box = []
 
     def texts(self):
         return [line.text for line in self.lines]
 
-    def find(self, *keys):
-        return next((line for line in self.lines if any(k in line.text for k in keys)), None)
+    def find(self, *keys, lines=None):
+        return next((line for line in (self.lines if lines is None else lines)
+                     if any(k in line.text for k in keys)), None)
+
+    def frac(self, *_):
+        return 0.0
+
+
+def withdraw_shot(pending=10, extra=()):
+    shot = FakeShot(extra)
+    rows = [("提領數值", 100, 100), ("5.00", 5, 200), ("立即提領", 9, 600)]
+    if pending is not None:
+        rows.append((f"待提領蝦幣數: {pending:.2f}", 100, 80))
+    shot.lines.extend(ocr.Line(text, [ocr.Word(text, x, y, 10, 10)]) for text, x, y in rows)
+    return shot
 
 
 class BotSafetyTests(unittest.TestCase):
@@ -128,6 +221,14 @@ class BotSafetyTests(unittest.TestCase):
         self.bot.pause = Mock()
         self.empty = FakeShot()
         self.phone.shot.return_value = self.empty
+
+    def prepare_withdrawal(self, shot=None):
+        shot = shot or withdraw_shot()
+        self.bot.cfg.withdraw = True
+        self.phone.shot.return_value = shot
+        self.bot.wait_for = Mock(return_value=(screens.Screen.WITHDRAW, shot))
+        self.bot.look = Mock(return_value=(screens.Screen.WITHDRAW, shot))
+        return shot
 
     def test_risk_blocks_popup_dismissal_and_all_navigation(self):
         self.phone.shot.return_value = FakeShot(["偵測到風險", "稍後再說"])
@@ -197,6 +298,7 @@ class BotSafetyTests(unittest.TestCase):
         self.phone.tap.assert_not_called()
 
     def test_claim_label_without_balance_change_is_not_counted(self):
+        self.phone.shot.return_value = FakeShot(["完成任務拿獎勵"])
         self.bot.look = Mock(return_value=(screens.Screen.PANEL, self.empty))
         before = screens.Panel(pending=10, claim=(1, 2), claim_amount=.21)
         after = screens.Panel(pending=10)
@@ -206,6 +308,7 @@ class BotSafetyTests(unittest.TestCase):
         self.assertEqual(self.store.day.watch_total, 0)
 
     def test_watch_claim_uses_observed_balance_difference(self):
+        self.phone.shot.return_value = FakeShot(["完成任務拿獎勵"])
         self.bot.look = Mock(return_value=(screens.Screen.PANEL, self.empty))
         self.bot.back_to_room = Mock()
         before = screens.Panel(pending=10, claim=(1, 2), claim_amount=99)
@@ -215,36 +318,127 @@ class BotSafetyTests(unittest.TestCase):
         self.assertEqual(self.store.day.watch_total, .21)
 
     def test_unknown_withdrawal_is_persisted_and_blocks_restart(self):
-        self.bot.wait_for = Mock(return_value=(screens.Screen.WITHDRAW, self.empty))
-        self.bot.look = Mock(return_value=(screens.Screen.WITHDRAW, self.empty))
-        page = screens.WithdrawPage(pending=10, options=[(5, (5, 5))], submit=(9, 9))
-        with patch.object(bot, "read_withdraw", return_value=page):
-            with self.assertRaises(bot.StopBot):
-                self.bot.withdraw(screens.Panel(pending=10, withdraw=(1, 1)))
+        self.prepare_withdrawal()
+        with self.assertRaises(bot.StopBot):
+            self.bot.withdraw(screens.Panel(pending=10, withdraw=(1, 1)))
         self.assertTrue(Store(self.store.path).day.withdrawal_pending)
         self.assertEqual(self.store.day.withdrawals, 0)
         self.assertEqual(self.phone.tap.call_count, 3)
         self.assertFalse(self.bot.should_withdraw(10, True))
 
     def test_general_limit_explanation_does_not_clear_transaction_journal(self):
-        shot = FakeShot(["每日提領上限為三次", "確認"])
-        self.bot.wait_for = Mock(return_value=(screens.Screen.WITHDRAW, shot))
-        self.bot.look = Mock(return_value=(screens.Screen.WITHDRAW, shot))
-        page = screens.WithdrawPage(pending=10, options=[(5, (5, 5))], submit=(9, 9))
-        with patch.object(bot, "read_withdraw", return_value=page):
-            with self.assertRaises(bot.StopBot):
-                self.bot.withdraw(screens.Panel(withdraw=(1, 1)))
+        self.prepare_withdrawal(withdraw_shot(extra=["每日提領上限為三次", "確認"]))
+        with self.assertRaises(bot.StopBot):
+            self.bot.withdraw(screens.Panel(withdraw=(1, 1)))
         self.assertTrue(Store(self.store.path).day.withdrawal_pending)
         self.assertEqual(self.phone.tap.call_count, 3)
 
     def test_unreadable_balance_does_not_use_stale_saved_balance(self):
         self.store.day.pending = 100
-        self.bot.wait_for = Mock(return_value=(screens.Screen.WITHDRAW, self.empty))
-        page = screens.WithdrawPage(options=[(5, (5, 5))], submit=(9, 9))
-        with patch.object(bot, "read_withdraw", return_value=page):
-            with self.assertRaises(bot.StopBot):
-                self.bot.withdraw(screens.Panel(withdraw=(1, 1)))
+        self.prepare_withdrawal(withdraw_shot(pending=None))
+        with self.assertRaises(bot.StopBot):
+            self.bot.withdraw(screens.Panel(withdraw=(1, 1)))
         self.phone.tap.assert_called_once_with(1, 1)
+
+    def test_disabled_withdrawal_never_touches_phone(self):
+        self.bot.withdraw(screens.Panel(withdraw=(1, 1)))
+        self.phone.tap.assert_not_called()
+
+    def test_nonfinite_pending_balance_never_requests_withdrawal(self):
+        self.bot.cfg.withdraw = True
+        for pending in (float("nan"), float("inf"), -float("inf")):
+            with self.subTest(pending=pending):
+                self.assertFalse(self.bot.should_withdraw(pending, True))
+
+    def test_changed_withdrawal_page_or_balance_prevents_submit(self):
+        for changed in (FakeShot(), withdraw_shot(5), withdraw_shot(None)):
+            with self.subTest(changed=changed.texts()):
+                self.phone.tap.reset_mock()
+                initial = self.prepare_withdrawal()
+                self.phone.shot.side_effect = [initial, changed]
+                with self.assertRaises(bot.StopBot):
+                    self.bot.withdraw(screens.Panel(withdraw=(1, 1)))
+                self.assertEqual(self.phone.tap.call_count, 2)
+                self.assertFalse(self.store.day.withdrawal_pending)
+
+    def test_screen_change_before_amount_selection_prevents_stale_touch(self):
+        self.prepare_withdrawal()
+        self.phone.shot.return_value = self.empty
+        with self.assertRaises(bot.StopBot):
+            self.bot.withdraw(screens.Panel(withdraw=(1, 1)))
+        self.phone.tap.assert_called_once_with(1, 1)
+
+    def test_changed_daily_limit_prevents_submit(self):
+        self.prepare_withdrawal()
+
+        def hit_limit(x, y):
+            if (x, y) == (5, 200):
+                self.store.day.withdrawals = 3
+
+        self.phone.tap.side_effect = hit_limit
+        with self.assertRaises(bot.StopBot):
+            self.bot.withdraw(screens.Panel(withdraw=(1, 1)))
+        self.assertEqual(self.phone.tap.call_count, 2)
+        self.assertFalse(self.store.day.withdrawal_pending)
+
+    def test_rejection_is_processed_before_confirmation_button(self):
+        self.prepare_withdrawal()
+        shot = withdraw_shot(extra=["確認提領", "已達每日提領上限"])
+        self.bot.look.return_value = (screens.Screen.WITHDRAW, shot)
+        self.bot.withdraw(screens.Panel(withdraw=(1, 1)))
+        self.assertNotIn(unittest.mock.call(100, 200), self.phone.tap.call_args_list)
+        self.assertEqual(self.store.day.withdrawals, 3)
+        self.assertFalse(Store(self.store.path).day.withdrawal_pending)
+
+    def test_unknown_screen_success_text_cannot_clear_journal(self):
+        self.prepare_withdrawal()
+        self.bot.look.return_value = (screens.Screen.UNKNOWN, FakeShot(["提領成功"]))
+        with self.assertRaises(bot.StopBot):
+            self.bot.withdraw(screens.Panel(withdraw=(1, 1)))
+        self.assertTrue(Store(self.store.path).day.withdrawal_pending)
+        self.assertEqual(self.store.day.withdrawals, 0)
+
+    def test_withdrawal_crossing_midnight_uses_live_day(self):
+        for rollover_on in ((5, 200), (9, 600)):
+            with self.subTest(rollover_on=rollover_on):
+                now = [datetime(2026, 10, 25, 23, 59, tzinfo=TAIPEI)]
+                with patch.object(state_module, "reward_now", side_effect=lambda: now[0]):
+                    self.store = Store(Path(self.tmp.name) / f"rollover-{rollover_on[0]}.json")
+                    self.bot.store = self.store
+                    self.prepare_withdrawal()
+                    self.bot.look.return_value = (screens.Screen.WITHDRAW, withdraw_shot(5))
+
+                    def tap(x, y):
+                        if (x, y) == (9, 600):
+                            self.assertTrue(Store(self.store.path).day.withdrawal_pending)
+                        if (x, y) == rollover_on:
+                            now[0] += timedelta(minutes=2)
+                            _ = self.store.day
+
+                    self.phone.tap.side_effect = tap
+                    self.bot.withdraw(screens.Panel(withdraw=(1, 1)))
+                    day = Store(self.store.path).day
+                    self.assertEqual(day.date, "2026-10-26")
+                    self.assertEqual(day.withdrawals, 1)
+                    self.assertEqual(day.withdrawn, 5)
+                    self.assertFalse(day.withdrawal_pending)
+
+    def test_panel_screen_change_prevents_claim_touch(self):
+        self.bot.look = Mock(return_value=(screens.Screen.PANEL, self.empty))
+        with self.assertRaises(bot.StopBot):
+            self.bot.panel_tasks()
+        self.phone.tap.assert_not_called()
+
+    def test_final_panel_crossing_midnight_resumes_new_day(self):
+        now = [datetime(2026, 10, 25, 23, 59, tzinfo=TAIPEI)]
+        with patch.object(state_module, "reward_now", side_effect=lambda: now[0]), \
+                patch.object(bot, "reward_now", side_effect=lambda: now[0]):
+            self.bot.store = Store(Path(self.tmp.name) / "final-panel.json")
+            self.bot.go_room = Mock()
+            self.bot.panel_tasks = Mock(side_effect=lambda **_: now.__setitem__(0, now[0] + timedelta(minutes=2)))
+            self.bot.rest_until_tomorrow()
+            self.bot.pause.assert_not_called()
+            self.assertFalse(self.bot.day.final_panel)
 
 
 class ScreenTests(unittest.TestCase):

@@ -22,7 +22,7 @@ import os
 import re
 import sys
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -109,8 +109,9 @@ class Phone:
                 if self.ts:
                     self.ts.close()
                     self.ts = None
-                if started and not retry:
-                    raise StopBot("觸控指令的回覆遺失，結果不明，停止以避免重複操作") from e
+                if not retry:
+                    reason = "觸控指令的回覆遺失，結果不明" if started else "無法連線，畫面座標可能已過期"
+                    raise StopBot(f"{reason}，停止以避免重複或錯誤操作") from e
                 if since is None:
                     since = time.monotonic()
                     log.warning("連不到 TouchSynthesis（%s）：手機上的 App 還開著嗎？Server 有啟動嗎？", e)
@@ -480,6 +481,8 @@ class Bot:
             return
         self.pause(1.5)  # 等畫面載完
         s = self.snapshot()
+        if detect(s) is not Screen.PANEL:
+            raise StopBot("任務面板已改變，停止使用舊畫面")
         p = read_panel(s)
         if p.claim:
             before = p.pending
@@ -495,6 +498,8 @@ class Bot:
                     break
                 self.pause(1)
                 s = self.snapshot()
+            if detect(s) is not Screen.PANEL:
+                raise StopBot("觀看任務領取後畫面已改變，結果待確認")
             after = read_panel(s)
             increase = (round(after.pending - before, 2)
                         if before is not None and after.pending is not None else None)
@@ -504,10 +509,13 @@ class Bot:
             amount = increase if increase is not None and increase > 0 else money(notice.text)
             if amount is None and notice:
                 amount = p.claim_amount
+            day = self.day
             day.watch_total = round(day.watch_total + (amount or 0.0), 2)
             log.info("✔ 觀看任務 +%s（領進待提領）", f"{amount:.2f}" if amount is not None else "?")
             p = after
         # 進度條下有「N分鐘」和終點的「90分鐘」兩個標籤；只剩一個 90 的話分不出是哪個，就不更新
+        day = self.day
+        day.last_panel = time.time()
         if len(p.minutes) >= 2 or (p.minutes and p.minutes[0] != 90):
             day.watch_minutes = p.minutes[0]
         if p.done or day.watch_minutes >= 90:
@@ -523,7 +531,8 @@ class Bot:
     def should_withdraw(self, pending: float, final: bool) -> bool:
         cfg, day = self.cfg, self.day
         if (not cfg.withdraw or day.withdrawal_pending
-                or day.withdrawals >= cfg.withdraw_daily_limit or pending < 1):
+                or day.withdrawals >= cfg.withdraw_daily_limit
+                or not math.isfinite(pending) or pending < 1):
             return False
         late = reward_now().hour == 23 and reward_now().minute >= 40
         return pending >= cfg.withdraw_min or final or late
@@ -533,6 +542,8 @@ class Bot:
         day = self.day
         if day.withdrawal_pending:
             raise StopBot("先前提領仍待確認，請核對帳戶後再啟用提領")
+        if not self.cfg.withdraw or day.withdrawals >= self.cfg.withdraw_daily_limit:
+            return
         if not p.withdraw:
             log.warning("面板上找不到「提領」")
             return
@@ -546,9 +557,12 @@ class Bot:
             self.capture("withdraw-not-open", s)
             return
         self.pause(1)
-        w = read_withdraw(self.snapshot())
+        s = self.snapshot()
+        if detect(s) is not Screen.WITHDRAW:
+            raise StopBot("提領頁已改變，取消選擇金額")
+        w = read_withdraw(s)
         pending = w.pending
-        if pending is None:
+        if pending is None or not math.isfinite(pending) or pending < 0:
             raise StopBot("無法讀取目前待提領餘額，停止提領")
         options = [(a, pos) for a, pos in w.options if 0 < a <= pending]
         if not options:
@@ -561,14 +575,23 @@ class Bot:
         self.pause(1)
         s = self.snapshot()
         w = read_withdraw(s)
+        if (detect(s) is not Screen.WITHDRAW or w.pending is None or not math.isfinite(w.pending)
+                or abs(w.pending - pending) > .009
+                or not any(option == amount for option, _ in w.options)):
+            raise StopBot("提領頁、餘額或面額已改變，取消送出，請重新確認畫面")
         if not w.submit:
             log.warning("找不到「立即提領」")
             self.phone.tap(*BACK)
             self.pause(2)
             return
         self.capture_once("withdraw-selected", s)
+        day = self.day  # Navigation/selection can cross midnight.
+        if (not self.cfg.withdraw or day.withdrawal_pending
+                or day.withdrawals >= self.cfg.withdraw_daily_limit):
+            raise StopBot("目前的提領設定或額度不允許送出")
         day.withdrawal_pending = True
         self.store.save()  # Journal before sending, including disconnect/interrupt outcomes.
+        self.ensure_running()
         self.phone.tap(*w.submit)
         confirmed = False
         for i in range(10):
@@ -576,11 +599,6 @@ class Bot:
             scr, s = self.look()
             if i == 1:
                 self.capture_once("withdraw-submitted", s)
-            confirm = next((ln for ln in s.lines if ln.text == "確認提領"), None)
-            if confirm and not confirmed and scr is Screen.WITHDRAW:
-                self.phone.tap(confirm.x, confirm.y)
-                confirmed = True
-                continue
             # 每天只能提領 3 次；手動提領過的話程式的計數會少算，看到上限提示就當作今天用完
             # （只看提領頁和面板，直播間的宣傳圖上常有「上限」之類的字）
             limit = next((ln.text for ln in s.lines
@@ -588,19 +606,28 @@ class Bot:
                           and any(marker in ln.text for marker in ("已達", "已超過", "已用完", "不能再"))), None)
             if limit:
                 log.info("提領被拒：%s，今天不再提領", limit)
+                day = self.day
                 day.withdrawals = self.cfg.withdraw_daily_limit
                 day.withdrawal_pending = False
                 self.store.save()
                 break
+            confirm = next((ln for ln in s.lines if ln.text == "確認提領"), None)
+            if confirm and not confirmed and scr is Screen.WITHDRAW:
+                self.phone.tap(confirm.x, confirm.y)
+                confirmed = True
+                continue
             if scr is Screen.WITHDRAW:
                 after = read_withdraw(s).pending
             elif scr is Screen.PANEL:
                 after = read_panel(s).pending
             else:
                 after = None
-            if s.find("提領成功") and after is None:
+            if scr in (Screen.WITHDRAW, Screen.PANEL) and s.find("提領成功") and after is None:
                 after = round(pending - amount, 2)
             if after is not None and abs(after - (pending - amount)) <= 0.01:
+                # An acknowledgement may arrive after midnight. Counting it today
+                # is conservative and clears the marker on the live Day object.
+                day = self.day
                 day.withdrawals += 1
                 day.withdrawn = round(day.withdrawn + amount, 2)
                 day.pending = after
@@ -667,13 +694,17 @@ class Bot:
 
     def rest_until_tomorrow(self):
         day = self.day
+        completed_date = day.date
         if not day.final_panel:
             self.go_room()
             self.panel_tasks(final=True)
+            day = self.day
+            if day.date != completed_date:
+                return
             day.final_panel = True
             self.store.save()
         log.info("今天能領的都領完了，休息到明天：%s", self.store.summary())
-        wake = (reward_now() + timedelta(days=1)).replace(hour=0, minute=3, second=0, microsecond=0)
+        wake = datetime.fromisoformat(f"{completed_date}T00:03:00+08:00") + timedelta(days=1)
         while reward_now() < wake and not self.time_up():
             self.pause(min(300, max(1, (wake - reward_now()).total_seconds())))
 

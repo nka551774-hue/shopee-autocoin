@@ -152,7 +152,7 @@ fun readCards(s: Snap): List<Card> = s.byPrefix("live_card_cover_").map { card -
 fun numberNear(s: Snap, anchor: N, below: Boolean): Double? {
     val a = anchor.bounds
     var best: Pair<Int, Double>? = null
-    for (n in s.nodes) {
+    for (n in s.trustedNodes) {
         if (!PURE_NUM.matches(n.text)) continue
         val b = n.bounds
         if (b.right < a.left - 200 || b.left > a.right + 200) continue

@@ -4,6 +4,7 @@ import android.graphics.Rect
 import android.view.accessibility.AccessibilityNodeInfo
 
 const val SHOPEE = "com.shopee.tw"
+internal val FREE_TEXT_IDS = setOf("public_screen_view", "danmaku_view", "scr_pin", "tv_live_title", "tv_anchor_name")
 
 /** 一個 UI 節點的快照。讀完就不再碰 AccessibilityNodeInfo，之後的查詢都在記憶體裡做。 */
 class N(
@@ -13,6 +14,7 @@ class N(
     val bounds: Rect,
     val clickable: Boolean,
     val index: Int,
+    val enabled: Boolean = true,
 ) {
     /** 自己和子孫在 [Snap.nodes] 裡的範圍是 [index, end)。 */
     var end: Int = index + 1
@@ -28,6 +30,18 @@ data class Pt(val x: Int, val y: Int)
 
 /** 一次讀取的畫面，只保留蝦皮自己的節點（跟電腦版的 uiautomator dump 看到的一樣）。 */
 class Snap(val nodes: List<N>, val pkg: String, val activity: String) {
+    val trustedNodes: List<N> by lazy(LazyThreadSafetyMode.NONE) {
+        val result = ArrayList<N>(nodes.size)
+        var i = 0
+        while (i < nodes.size) {
+            val node = nodes[i]
+            if (node.rid in FREE_TEXT_IDS) i = node.end else {
+                result.add(node)
+                i++
+            }
+        }
+        result
+    }
     // A screen is immutable; build the frequently used ID lookup once per snapshot.
     private val byId by lazy(LazyThreadSafetyMode.NONE) {
         HashMap<String, N>(nodes.size).apply {
@@ -36,8 +50,14 @@ class Snap(val nodes: List<N>, val pkg: String, val activity: String) {
     }
     fun id(rid: String) = byId[rid]
     fun byPrefix(prefix: String) = nodes.filter { it.rid.startsWith(prefix) }
-    fun text(t: String) = nodes.firstOrNull { it.text == t }
-    fun desc(d: String) = nodes.firstOrNull { it.desc == d }
+    private val byText by lazy(LazyThreadSafetyMode.NONE) {
+        HashMap<String, N>(trustedNodes.size).apply { for (n in trustedNodes) putIfAbsent(n.text, n) }
+    }
+    private val byDesc by lazy(LazyThreadSafetyMode.NONE) {
+        HashMap<String, N>(trustedNodes.size).apply { for (n in trustedNodes) putIfAbsent(n.desc, n) }
+    }
+    fun text(t: String) = byText[t]
+    fun desc(d: String) = byDesc[d]
     fun sub(n: N): List<N> = nodes.subList(n.index, n.end)
     fun find(n: N, rid: String) = sub(n).firstOrNull { it.rid == rid }
     fun texts(n: N) = sub(n).map { it.text }.filter { it.isNotEmpty() }
@@ -87,6 +107,7 @@ class Snap(val nodes: List<N>, val pkg: String, val activity: String) {
                 bounds = rect,
                 clickable = info.isClickable,
                 index = out.size,
+                enabled = info.isEnabled,
             )
             out.add(n)
             for (i in 0 until info.childCount) {

@@ -655,8 +655,11 @@ class Bot:
         label = s.text("待提領蝦幣數")
         if label:
             return number_near(s, label, below=True)
-        n = next((n for n in s.nodes if n.text.startswith("待提領蝦幣數:")), None)  # 提領頁的寫法
-        return num(n.text.split(":", 1)[1]) if n else None
+        for node in s.trusted_nodes:
+            match = re.fullmatch(r"待提領蝦幣數[:：]\s*(\d+(?:\.\d+)?)\s*", node.text)
+            if match:
+                return num(match[1])
+        return None
 
     def panel_tasks(self, final: bool = False):
         """開任務獎勵面板：把觀看任務的蝦幣領進待提領，需要時提領。
@@ -678,6 +681,8 @@ class Bot:
             return
         self.pause(1.5)  # 等 RN 畫面載完
         s = self.snapshot()
+        if detect(s) is not Screen.PANEL:
+            raise StopBot("任務面板已改變，停止使用舊畫面")
         btn = s.text("領取")
         if btn:
             before_pending = self.pending_amount(s)
@@ -690,12 +695,14 @@ class Bot:
                     and before_pending is not None and after_pending is not None
                     and after_pending > before_pending):
                 amount = round(after_pending - before_pending, 2)
+                day = self.day
                 day.watch_total = round(day.watch_total + amount, 2)
                 log.info("✔ 觀看任務 +%.2f（領進待提領）", amount)
             else:
                 self.capture("watch-claim-unknown", s)
                 raise StopBot("觀看任務領取結果不明，已停止並保留統計")
         # 進度條下有「N分鐘」和終點的「90分鐘」兩個標籤；只剩一個 90 的話分不出是哪個，就不更新
+        day = self.day
         minutes = sorted(int(n.text[:-2]) for n in s.trusted_nodes if re.fullmatch(r"\d+分鐘", n.text))
         if len(minutes) >= 2 or (minutes and minutes[0] != 90):
             day.watch_minutes = minutes[0]
@@ -713,7 +720,8 @@ class Bot:
     def should_withdraw(self, pending: float, final: bool) -> bool:
         cfg, day = self.cfg, self.day
         if (not cfg.withdraw or day.withdrawal_pending
-                or day.withdrawals >= cfg.withdraw_daily_limit or pending < 1):
+                or day.withdrawals >= cfg.withdraw_daily_limit
+                or not math.isfinite(pending) or pending < 1):
             return False
         late = reward_now().hour == 23 and reward_now().minute >= 40
         return pending >= cfg.withdraw_min or final or late
@@ -721,6 +729,8 @@ class Bot:
     def withdraw(self, s: Snapshot):
         """在面板按「提領」，選不超過待提領的最大面額，送出並確認待提領有變少。"""
         day = self.day
+        if not self.cfg.withdraw or day.withdrawals >= self.cfg.withdraw_daily_limit:
+            return
         if day.withdrawal_pending:
             raise StopBot("先前提領結果尚未確認，請核對紀錄後再恢復自動提領")
         btn = s.text("提領")
@@ -733,6 +743,8 @@ class Bot:
             return
         self.pause(1)
         s = self.snapshot()
+        if detect(s) is not Screen.WITHDRAW:
+            raise StopBot("提領頁已改變，取消選擇金額")
         pending = self.pending_amount(s)
         if pending is None or pending < 1:
             log.warning("無法確認目前可提領餘額，取消提領")
@@ -751,12 +763,25 @@ class Bot:
         amount, node = max(options, key=lambda t: t[0])
         self.dev.tap_node(node)
         self.pause(1)
-        submit = self.snapshot().text("立即提領")
+        s = self.snapshot()
+        if detect(s) is not Screen.WITHDRAW:
+            raise StopBot("提領頁已改變，取消送出")
+        latest_pending = self.pending_amount(s)
+        if latest_pending is None or abs(latest_pending - pending) > 0.001:
+            raise StopBot("提領餘額在送出前改變或無法辨識，請重新核對")
+        selected = s.text(node.text)
+        if selected is None or selected.el.get("enabled") == "false":
+            raise StopBot("已選擇的提領金額不再可用，取消送出")
+        submit = s.text("立即提領")
         if not submit:
             log.warning("找不到「立即提領」")
             self.dev.back()
             return
         self.dev.clear_toast()
+        day = self.day
+        if (not self.cfg.withdraw or day.withdrawal_pending
+                or day.withdrawals >= self.cfg.withdraw_daily_limit):
+            raise StopBot("提領條件在送出前已改變，取消送出")
         day.withdrawal_pending = True
         self.store.save()
         self.dev.tap_node(submit)
@@ -765,11 +790,6 @@ class Bot:
             self.pause(1)
             scr, s = self.look()
             self.check_messages(s, self.dev.last_toast())
-            confirm = s.text("確認提領")
-            if confirm and not confirmed:
-                self.dev.tap_node(confirm)
-                confirmed = True
-                continue
             # 每天只能提領 3 次；如果手動提領過，程式的計數會少算，看到上限提示就當作今天用完
             limit = None
             if scr in (Screen.WITHDRAW, Screen.PANEL):
@@ -778,12 +798,19 @@ class Bot:
                                                      ("已達", "已超過", "已用完", "不能再"))), None)
             if limit:
                 log.info("提領被拒：%s，今天不再提領", limit)
+                day = self.day
                 day.withdrawals = self.cfg.withdraw_daily_limit
                 day.withdrawal_pending = False
                 self.store.save()
                 break
-            after = self.pending_amount(s)
+            confirm = s.text("確認提領") if scr is Screen.WITHDRAW else None
+            if confirm and not confirmed:
+                self.dev.tap_node(confirm)
+                confirmed = True
+                continue
+            after = self.pending_amount(s) if scr in (Screen.WITHDRAW, Screen.PANEL) else None
             if after is not None and abs(after - (pending - amount)) < 0.011:
+                day = self.day
                 day.withdrawals += 1
                 day.withdrawal_pending = False
                 day.withdrawn += amount
@@ -857,13 +884,17 @@ class Bot:
 
     def rest_until_tomorrow(self):
         day = self.day
+        completed_date = day.date
         if not day.final_panel:
             self.go_live()
             self.panel_tasks(final=True)
+            day = self.day
+            if day.date != completed_date:
+                return  # 收尾跨午夜後，立即開始新獎勵日。
             day.final_panel = True
             self.store.save()
         log.info("今天能領的都領完了，休息到明天：%s", self.store.summary())
-        wake = (reward_now() + timedelta(days=1)).replace(hour=0, minute=3, second=0, microsecond=0)
+        wake = datetime.fromisoformat(f"{completed_date}T00:03:00+08:00") + timedelta(days=1)
         while reward_now() < wake and not self.time_up():
             self.pause(min(300, max(1, (wake - reward_now()).total_seconds())))
 

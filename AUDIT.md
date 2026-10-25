@@ -2,6 +2,37 @@
 
 日期：2026-10-25（Asia/Taipei）。基準版本：`f421c31`。範圍包含 `autocoin/`、`android/`、`ios/`、原有但尚未追蹤的 `ios-jb/` 與 `ios-app/`，以及 GitHub Actions。
 
+## 接手複查（2026-10-25，基準 `9d2d9db`）
+
+本輪接續未提交的 Python／iOS 修正，並對照原生 Android 的同一套流程。專案由下列獨立入口組成；共用設定與統計不代表各版本的裝置操作實作相同。
+
+| 範圍 | 結構與責任 |
+|---|---|
+| `autocoin/` | `__main__.py` CLI 與程序鎖 → `bot.py` 排程／狀態機 → `device.py` ADB／uiautomator2；`ui.py` 保存 XML 快照，`screens.py` 解析畫面 |
+| `autocoin/state.py` | 各 Python 版本共用的台灣獎勵日、每日額度、原子存檔、未確認提領標記與排他鎖 |
+| `ios/` | `bot.py` 控制流程 → `tsclient.py` TCP TouchSynthesis；`screens.py` 與 `ocr.py` 用 Windows OCR、像素與固定幾何辨識畫面 |
+| `android/` | `MainActivity` 設定與統計 → `CoinService` 單一 worker／無障礙輸入 → `Bot`；`Ui`／`Screens` 快照解析，`Store` 同步保存狀態 |
+| `ios-jb/` | ZXTouch 傳輸、手機端 OCR 與 bot；`serve.py` 是 loopback HTTP 控制器，shell／launchd 負責啟停 |
+| `ios-app/` | 實驗性 Swift／Vision 原始碼，缺 Xcode 工程、App 入口與 TouchSynthesizer，無法直接建置 IPA |
+| `.github/workflows/` | Checks 驗證 Python／Android，Nightly 在驗證成功後檢查簽署設定，再獨立建置及發布 |
+
+本輪修正：
+
+- Python、iOS 與原生 Android 在送出及回覆階段重新取得當日狀態，確保跨午夜的 journal 與成功計數寫到目前獎勵日；收尾跨日後立即恢復新一天，避免多睡一天。
+- 提領選額及送出前重新確認畫面、最新餘額、面額、提領設定與額度；讀不到最新餘額不再沿用舊快照，非有限金額不允許進入自動提領。
+- 原生 Android 只接受已知面板／提領頁上的精確餘額差；一般「上限」說明、聊天文字與未知畫面不會解除 journal。「確認提領」最多按一次，明確拒絕優先處理。
+- iOS 任務面板與提領畫面切換後停止使用舊座標；未知畫面上的「提領成功」不再當作完成憑據；觸控建立連線失敗亦停止，不重試可能過期的座標。
+- TouchSynthesis 的整體期限包含等待 socket 鎖；只有持鎖命令的協定錯誤才關閉連線，排隊逾時不破壞另一個命令。回覆 ID、tree 與 screenshot payload 都在同一 transaction 內驗證。
+- 原生 Android 對可信 text／content-desc 建立惰性索引，保留第一個匹配節點並排除自由文字容器；餘額正規表示式只建立一次。此輪沒有執行效能 benchmark，不宣稱新的加速倍數。
+
+接手時 iOS 測試有 3 項失敗：原 fixture 關閉了提領，使新增保護提前返回。測試現明確開啟提領，並使用具有真實畫面邊界的離線 OCR 行，透過正式 parser 驗證提領路徑，未移除保護或弱化成功條件。
+
+本輪驗證：pytest **77** 項、iOS unittest **42** 項、越獄版 unittest **41** 項、Android JVM **30** 項，合計 **190** 項回歸測試通過；另有 loopback selftest **36** 項檢查通過。Ruff、`pip check`、`pip-audit` 與 Git diff whitespace 檢查通過。
+
+Android 在 JDK 21.0.10、Android 36 SDK、Gradle 9.7.1 執行 `testDebugUnitTest lintDebug assembleDebug` 成功，JVM 結果為 0 failures／0 errors／0 skipped，Lint XML 為空問題清單，debug APK 已產生。使用全新 ASCII 暫存建置目錄，逐一比對 22 個 Git 追蹤 Android 檔案的 SHA-256，確認與工作目錄一致。編譯仍有原有 `AccessibilityNodeInfo.recycle()` 棄用及 Gradle 10 相容性警告；未將此次成功宣稱為無警告或 Gradle 10 相容。
+
+以上測試不會接觸真實手機或蝦皮帳戶。下方效能數據、Swift 語法及 workflow 工具結果屬首次稽核，沒有冒充本輪重新量測或真機驗證。
+
 ## 已修正的主要問題
 
 | 影響 | 原本的問題 | 修正 |

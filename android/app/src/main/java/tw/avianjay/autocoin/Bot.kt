@@ -1,9 +1,11 @@
 package tw.avianjay.autocoin
 
 import java.time.LocalDateTime
+import java.time.LocalDate
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import kotlin.math.roundToInt
+import kotlin.math.abs
 
 // 主流程（對應電腦版 bot.py）：挑有蝦幣的直播間、待著領取、轉盤、定時開面板領觀看任務與提領。
 
@@ -33,9 +35,6 @@ private val MSG_RISK = listOf("不符合領取此獎勵資格", "偵測到風險
 private val MSG_DAILY_LIMIT = listOf("已超過今天領取的次數限制", "您已達領取上限")
 private val MSG_ROOM_DONE = listOf("直播蝦幣已全部發放")
 private val MSG_WHEEL_LIMIT = listOf("達到每日參與上限", "達到每日上限")
-private val CONFIRM_TEXTS = setOf("確認", "確定", "確認提領")
-// 觀眾、直播主可以自由打字的地方，比對提示文字時要略過
-private val FREE_TEXT_IDS = setOf("public_screen_view", "danmaku_view", "scr_pin", "tv_live_title", "tv_anchor_name")
 
 private val REASONS = mapOf(
     "no_coins" to "沒有直播間蝦幣",
@@ -50,6 +49,7 @@ private val REASONS = mapOf(
 // 因為這些原因離開的直播間，今天就不再進去
 private val DONE_REASONS = setOf("no_coins", "room_done", "timeout", "watched", "wheel_checked")
 private val STAMP = DateTimeFormatter.ofPattern("MMdd-HHmmss")
+private val PENDING_AMOUNT = Regex("""待提領蝦幣數[:：]\s*(\d+(?:\.\d+)?)\s*""")
 
 private fun round2(v: Double) = (v * 100).roundToInt() / 100.0
 
@@ -57,6 +57,7 @@ class Bot(
     private val phone: Phone,
     private val store: Store,
     private val cfg: Settings,
+    private val sleepFor: (Long) -> Unit = { Thread.sleep(it) },
     private val status: (String) -> Unit,
 ) {
     private val day get() = store.day
@@ -70,7 +71,7 @@ class Bot(
     // ---------------- 基本工具 ----------------
     private fun now() = System.currentTimeMillis()
     private fun elapsedNow() = System.nanoTime() / 1_000_000
-    private fun sleep(ms: Long) = Thread.sleep(Jitter.ms(ms))  // 按停止會 interrupt，丟出 InterruptedException 就整個結束
+    private fun sleep(ms: Long) = sleepFor(Jitter.ms(ms))  // 按停止會 interrupt，丟出 InterruptedException 就整個結束
 
     private fun snapshot(): Snap {
         if (Thread.currentThread().isInterrupted) throw InterruptedException("已停止")
@@ -647,13 +648,15 @@ class Bot(
 
     private fun pendingAmount(s: Snap): Double? {
         s.text("待提領蝦幣數")?.let { return numberNear(s, it, below = true) }
-        val n = s.nodes.firstOrNull { it.text.startsWith("待提領蝦幣數:") } ?: return null  // 提領頁的寫法
-        return num(n.text.substringAfter(":"))
+        return s.trustedNodes.firstNotNullOfOrNull {
+            PENDING_AMOUNT.matchEntire(it.text)
+                ?.groupValues?.get(1)?.let(::num)
+        }
     }
 
     /** 開任務獎勵面板：把觀看任務的蝦幣領進待提領，需要時提領。直播間會縮成浮窗，倒數不受影響。 */
     private fun panelTasks(final: Boolean = false): Boolean {
-        val day = this.day
+        var day = this.day
         nextPanelAttempt = elapsedNow() + 60_000
         var (scr, s) = look()
         if (scr == Screen.ROOM) {
@@ -677,14 +680,15 @@ class Bot(
         if (detect(s) != Screen.PANEL) return false
         val btn = s.text("領取")
         if (btn != null) {
-            val amount = numberNear(s, btn, below = false) ?: 0.0
             val pendingBefore = pendingAmount(s)
             phone.tap(btn.center)
             sleep(3000)
             s = snapshot()
             val pendingAfter = pendingAmount(s)
-            if (detect(s) == Screen.PANEL && amount > 0.0 && pendingBefore != null && pendingAfter != null &&
-                pendingAfter >= pendingBefore + amount - 0.01) {
+            if (detect(s) == Screen.PANEL && s.text("領取") == null && pendingBefore != null && pendingAfter != null &&
+                pendingAfter > pendingBefore) {
+                val amount = round2(pendingAfter - pendingBefore)
+                day = this.day
                 day.watchTotal = round2(day.watchTotal + amount)
                 AppLog.i("✔ 觀看任務 +%.2f（領進待提領）".format(amount))
             } else {
@@ -694,16 +698,18 @@ class Bot(
             }
         }
         // 進度條下有「N分鐘」和終點的「90分鐘」兩個標籤；只剩一個 90 的話分不出是哪個，就不更新
-        val minutes = s.nodes.mapNotNull {
+        day = this.day
+        val minutes = s.trustedNodes.mapNotNull {
             Regex("""(\d+)分鐘""").matchEntire(it.text)?.groupValues?.get(1)?.toIntOrNull()?.takeIf { m -> m in 0..90 }
         }.sorted()
         if (minutes.size >= 2 || (minutes.isNotEmpty() && minutes[0] != 90)) day.watchMinutes = minutes[0]
         if (s.text("明天再來") != null || day.watchMinutes >= 90) day.watchDone = true
-        pendingAmount(s)?.let { day.pending = it }
+        val pending = pendingAmount(s)
+        pending?.let { day.pending = it }
         day.lastPanel = now()
         store.save()
         AppLog.i("待提領 %.2f｜觀看任務 %d/90 分鐘".format(day.pending, day.watchMinutes))
-        if (shouldWithdraw(day.pending, final)) withdraw(s)
+        if (pending != null && shouldWithdraw(pending, final)) withdraw(s)
         val cur = look()
         backToRoom(cur.first, cur.second)
         return true
@@ -712,7 +718,7 @@ class Bot(
     private fun shouldWithdraw(pending: Double, final: Boolean): Boolean {
         val day = this.day
         // 提領是可選的，而且蝦皮規定每天最多 3 次
-        if (!cfg.withdraw || day.withdrawalUncertain || day.withdrawals >= cfg.withdrawDailyLimit || pending < 1) return false
+        if (!cfg.withdraw || day.withdrawalUncertain || day.withdrawals >= cfg.withdrawDailyLimit || !pending.isFinite() || pending < 1) return false
         val t = LocalTime.now(REWARD_ZONE)
         val late = t.hour == 23 && t.minute >= 40
         return pending >= cfg.withdrawMin || final || late
@@ -720,11 +726,11 @@ class Bot(
 
     /** 在面板按「提領」，選不超過待提領的最大面額，送出並確認待提領有變少。 */
     private fun withdraw(panel: Snap) {
-        val day = this.day
+        var day = this.day
         if (day.withdrawalUncertain || !cfg.withdraw || day.withdrawals >= cfg.withdrawDailyLimit) return
         val btn = panel.text("提領") ?: return
         phone.tap(btn.center)
-        val (scr, page) = waitFor(setOf(Screen.WITHDRAW), 10_000)
+        val (scr, _) = waitFor(setOf(Screen.WITHDRAW), 10_000)
         if (scr != Screen.WITHDRAW) {
             AppLog.w("提領頁沒打開（目前在${scr.label}）")
             return
@@ -732,11 +738,11 @@ class Bot(
         sleep(1000)
         var s = snapshot()
         if (detect(s) != Screen.WITHDRAW) return
-        val pending = pendingAmount(s) ?: pendingAmount(page) ?: return
+        val pending = pendingAmount(s)?.takeIf { it >= 1 } ?: return
         val floatWin = s.id("rl_float_window")?.bounds  // 直播浮窗會蓋住部分選項
-        val options = s.nodes.mapNotNull { n ->
+        val options = s.trustedNodes.mapNotNull { n ->
             val amt = Regex("""(\d+)\.00""").matchEntire(n.text)?.groupValues?.get(1)?.toIntOrNull() ?: return@mapNotNull null
-            if (amt <= 0 || amt > pending || (floatWin != null && floatWin.contains(n.cx, n.cy))) null else amt to n
+            if (amt <= 0 || amt > pending || !n.enabled || (floatWin != null && floatWin.contains(n.cx, n.cy))) null else amt to n
         }
         val choice = options.maxByOrNull { it.first }
         if (choice == null) {
@@ -748,6 +754,11 @@ class Bot(
         phone.tap(node.center)
         sleep(1000)
         val submitPage = snapshot()
+        val latestPending = pendingAmount(submitPage)
+        if (detect(submitPage) != Screen.WITHDRAW || latestPending == null || abs(latestPending - pending) > .001 ||
+            submitPage.text(node.text)?.enabled != true) {
+            throw StopBot("提領頁、餘額或面額已改變，取消送出")
+        }
         val submit = if (detect(submitPage) == Screen.WITHDRAW) submitPage.text("立即提領") else null
         if (submit == null) {
             AppLog.w("找不到「立即提領」")
@@ -755,26 +766,42 @@ class Bot(
             return
         }
         phone.clearToast()
+        day = this.day
+        if (day.withdrawalUncertain || !cfg.withdraw || day.withdrawals >= cfg.withdrawDailyLimit) {
+            throw StopBot("提領條件在送出前已改變，取消送出")
+        }
         day.withdrawalUncertain = true
         store.save()
         phone.tap(submit.center)
         var done = false
+        var confirmed = false
         for (i in 0 until 10) {
             sleep(1000)
             s = snapshot()
+            val currentScreen = detect(s)
             // 每天只能提領 3 次；如果手動提領過，計數會少算，看到上限提示就當作今天用完
-            val limit = (s.textsExcluding(emptySet()) + phone.lastToast())
-                .firstOrNull { "上限" in it || ("次" in it && "已" in it && "提領" in it) }
+            val limit = if (currentScreen in setOf(Screen.WITHDRAW, Screen.PANEL)) {
+                (s.textsExcluding(FREE_TEXT_IDS) + phone.lastToast())
+                    .firstOrNull { text -> "提領" in text && listOf("已達", "已超過", "已用完", "不能再").any { it in text } }
+            } else null
             if (limit != null) {
                 AppLog.i("提領被拒：$limit，今天不再提領")
+                day = this.day
                 day.withdrawals = cfg.withdrawDailyLimit
                 day.withdrawalUncertain = false
                 store.save()
                 done = true
                 break
             }
-            val after = pendingAmount(s)
-            if (after != null && after <= pending - amount + 0.01) {
+            val confirm = s.text("確認提領")
+            if (confirm != null && !confirmed && currentScreen == Screen.WITHDRAW) {
+                phone.tap(confirm.center)
+                confirmed = true
+                continue
+            }
+            val after = if (currentScreen in setOf(Screen.WITHDRAW, Screen.PANEL)) pendingAmount(s) else null
+            if (after != null && abs(after - (pending - amount)) < .011) {
+                day = this.day
                 day.withdrawals++
                 day.withdrawn += amount
                 day.pending = after
@@ -784,14 +811,12 @@ class Bot(
                 done = true
                 break
             }
-            val confirm = s.nodes.firstOrNull { it.text in CONFIRM_TEXTS }
-            if (confirm != null && detect(s) == Screen.WITHDRAW) phone.tap(confirm.center)
         }
         if (!done) {
             AppLog.w("提領結果不明，畫面已存檔；自動提領已鎖定，請先核對帳戶與統計資料")
             capture("withdraw-unknown", s)
         }
-        phone.back()
+        if (detect(s) in setOf(Screen.WITHDRAW, Screen.PANEL)) phone.back()
     }
 
     // ---------------- 主迴圈 ----------------
@@ -871,19 +896,22 @@ class Bot(
     }
 
     private fun restUntilTomorrow() {
-        val day = this.day
+        var day = this.day
+        val completedDate = day.date
         if (!day.finalPanel) {
             goLive()
             if (!panelTasks(final = true)) {
                 sleep(60_000)
                 return
             }
+            day = this.day
+            if (day.date != completedDate) return
             day.finalPanel = true
             store.save()
         }
         AppLog.i("今天能領的都領完了，休息到明天：${store.summary()}")
         status("今天領完了，明天再來")
-        val wake = LocalDateTime.now(REWARD_ZONE).plusDays(1).withHour(0).withMinute(3).withSecond(0)
+        val wake = LocalDate.parse(completedDate).plusDays(1).atTime(0, 3)
             .atZone(REWARD_ZONE).toInstant().toEpochMilli()
         while (now() < wake) sleep(minOf(300_000L, maxOf(1000L, wake - now())))
     }

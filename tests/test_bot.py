@@ -1,13 +1,15 @@
 from collections import deque
+from datetime import datetime, timedelta
 from unittest.mock import Mock
 
 import pytest
 
 from autocoin import bot as bot_module
+from autocoin import state as state_module
 from autocoin.bot import Bot, StopBot
 from autocoin.config import Config
 from autocoin.screens import read_room
-from autocoin.state import StateError, Store
+from autocoin.state import StateError, Store, TAIPEI
 from autocoin.ui import PKG, Snapshot
 
 
@@ -249,3 +251,94 @@ def test_leaving_watch_room_early_does_not_mark_completed(make_bot):
     b.leave = Mock()
     b.finish_room({"room"}, "lost", "watch")
     assert not b.day.room("room")["watched"]
+
+
+@pytest.mark.parametrize("rollover_on", ["5.00", "立即提領"])
+def test_withdrawal_crossing_midnight_keeps_journal_and_books_current_day(make_bot, monkeypatch, rollover_on):
+    now = [datetime(2026, 10, 25, 23, 59, tzinfo=TAIPEI)]
+    monkeypatch.setattr(state_module, "reward_now", lambda: now[0])
+    b = make_bot([withdraw_page(), withdraw_page(), withdraw_page(), withdraw_page(0)])
+
+    def on_tap(text):
+        if text == "立即提領":
+            assert Store(b.store.path).day.withdrawal_pending
+        if text == rollover_on:
+            now[0] += timedelta(days=1)
+            _ = b.store.day  # A message/status read can cause rollover mid-operation.
+
+    b.dev.on_tap = on_tap
+    b.withdraw(panel())
+    day = Store(b.store.path).day
+    assert day.date == "2026-10-26"
+    assert day.withdrawals == 1
+    assert day.withdrawn == 5
+    assert not day.withdrawal_pending
+
+
+def test_watch_reward_after_midnight_updates_live_day(make_bot, monkeypatch):
+    now = [datetime(2026, 10, 25, 23, 59, tzinfo=TAIPEI)]
+    monkeypatch.setattr(state_module, "reward_now", lambda: now[0])
+    b = make_bot([panel(5), panel(5), panel(5.2, False)])
+    b.cfg.withdraw = False
+    b.back_to_room = Mock()
+
+    def on_tap(_):
+        now[0] += timedelta(days=1)
+        _ = b.store.day
+
+    b.dev.on_tap = on_tap
+    b.panel_tasks()
+    assert Store(b.store.path).day.watch_total == 0.2
+
+
+def test_withdrawal_rechecks_balance_before_submit(make_bot):
+    b = make_bot([withdraw_page(5), withdraw_page(5), withdraw_page(10)])
+    with pytest.raises(StopBot):
+        b.withdraw(panel())
+    assert "立即提領" not in b.dev.actions
+    assert not b.day.withdrawal_pending
+
+
+def test_withdrawal_rechecks_limit_before_submit(make_bot):
+    b = make_bot([withdraw_page()])
+    b.dev.on_tap = lambda text: setattr(b.day, "withdrawals", 3) if text == "5.00" else None
+    with pytest.raises(StopBot):
+        b.withdraw(panel())
+    assert "立即提領" not in b.dev.actions
+
+
+def test_rejection_is_handled_before_confirmation_button(make_bot):
+    rejected = withdraw_page(extra=node(text="確認提領") + node(text="已達每日提領上限"))
+    b = make_bot([withdraw_page(), withdraw_page(), withdraw_page(), rejected])
+    b.withdraw(panel())
+    assert "確認提領" not in b.dev.actions
+    assert b.day.withdrawals == 3
+
+
+def test_unknown_screen_balance_cannot_confirm_withdrawal(make_bot):
+    unknown = snap(node(text="待提領蝦幣數: 0"))
+    b = make_bot([withdraw_page(), withdraw_page(), withdraw_page(), unknown])
+    with pytest.raises(StopBot):
+        b.withdraw(panel())
+    assert b.day.withdrawal_pending
+    assert b.day.withdrawals == 0
+
+
+def test_chat_and_negative_numbers_cannot_supply_pending_balance(make_bot):
+    b = make_bot([room()])
+    fake_balance = snap(node("public_screen_view", children=node(text="待提領蝦幣數: 50")))
+    assert b.pending_amount(fake_balance) is None
+    assert b.pending_amount(snap(node(text="待提領蝦幣數: -5"))) is None
+
+
+def test_final_panel_crossing_midnight_does_not_sleep_a_whole_extra_day(make_bot, monkeypatch):
+    now = [datetime(2026, 10, 25, 23, 59, tzinfo=TAIPEI)]
+    monkeypatch.setattr(state_module, "reward_now", lambda: now[0])
+    monkeypatch.setattr(bot_module, "reward_now", lambda: now[0])
+    b = make_bot([room()])
+    b.go_live = Mock()
+    b.pause = Mock(side_effect=AssertionError("must resume new day immediately"))
+    b.panel_tasks = lambda **_: now.__setitem__(0, now[0] + timedelta(minutes=2))
+    b.rest_until_tomorrow()
+    b.pause.assert_not_called()
+    assert not b.day.final_panel

@@ -21,6 +21,7 @@ import sys
 import time
 import threading
 import uuid
+from contextlib import contextmanager
 
 
 class ProtocolError(RuntimeError):
@@ -47,6 +48,22 @@ class TouchSynthesis:
     def __exit__(self, *_):
         self.close()
 
+    @contextmanager
+    def _transaction(self, timeout: float):
+        """The timeout includes queueing behind another command on this socket."""
+        deadline = time.monotonic() + timeout
+        if not self._lock.acquire(timeout=timeout):
+            # Another request still owns the socket; do not interrupt its reply.
+            raise TimeoutError("TouchSynthesis command queue deadline exceeded")
+        try:
+            yield deadline
+        except BaseException:
+            # A partial frame or invalid payload makes subsequent actions ambiguous.
+            self.close()
+            raise
+        finally:
+            self._lock.release()
+
     def _remaining(self, deadline: float):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -71,13 +88,8 @@ class TouchSynthesis:
         return self._recv_exact(length, deadline)
 
     def call(self, action: str, **params) -> dict:
-        with self._lock:
-            try:
-                return self._call(action, params, time.monotonic() + self.timeout)
-            except BaseException:
-                # A partial frame or late reply makes subsequent actions ambiguous.
-                self.close()
-                raise
+        with self._transaction(self.timeout) as deadline:
+            return self._call(action, params, deadline)
 
     def _call(self, action: str, params: dict, deadline: float) -> dict:
         cmd_id = uuid.uuid4().hex
@@ -94,10 +106,11 @@ class TouchSynthesis:
                 raise ProtocolError("Invalid JSON response") from exc
             if not isinstance(resp, dict):
                 raise ProtocolError("Response must be a JSON object")
-            if resp.get("id") == cmd_id:
-                if resp.get("success") is not True:
-                    raise RuntimeError(f"{action} 失敗：{resp.get('error')}")
-                return resp
+            if resp.get("id") != cmd_id:
+                raise ProtocolError("Response ID does not match the active command")
+            if resp.get("success") is not True:
+                raise RuntimeError(f"{action} 失敗：{resp.get('error')}")
+            return resp
 
     def tap(self, x: float, y: float):
         self.call("tap", x=x, y=y)
@@ -110,14 +123,14 @@ class TouchSynthesis:
 
     def screenshot(self, quality: float = 0.8) -> bytes:
         """JPEG，走 XCTest 的截圖（新版 App）；舊版 App 會改走通道上的 DVT 截圖。"""
-        data = self.call("screenshot", quality=quality).get("data")
-        try:
-            if not isinstance(data, str):
-                raise ValueError("Screenshot data is not a string")
-            return base64.b64decode(data, validate=True)
-        except ValueError as exc:
-            self.close()
-            raise ProtocolError("Invalid screenshot encoding") from exc
+        with self._transaction(self.timeout) as deadline:
+            data = self._call("screenshot", {"quality": quality}, deadline).get("data")
+            try:
+                if not isinstance(data, str):
+                    raise ValueError("Screenshot data is not a string")
+                return base64.b64decode(data, validate=True)
+            except ValueError as exc:
+                raise ProtocolError("Invalid screenshot encoding") from exc
 
     def launch_app(self, bundle_id: str):
         """把 App 叫到前景（沒開就啟動）。"""
@@ -125,7 +138,14 @@ class TouchSynthesis:
 
     def tree(self, bundle_id: str) -> dict:
         """App 畫面的元件樹（XCUIElementSnapshot.dictionaryRepresentation）。"""
-        return json.loads(self.call("tree", bundleId=bundle_id)["data"])
+        with self._transaction(self.timeout) as deadline:
+            try:
+                result = json.loads(self._call("tree", {"bundleId": bundle_id}, deadline)["data"])
+                if not isinstance(result, dict):
+                    raise ValueError("Tree must be a JSON object")
+                return result
+            except (ValueError, TypeError, KeyError) as exc:
+                raise ProtocolError("Invalid tree payload") from exc
 
     def grab(self, quality: float = 0.6, skip: int = 1, timeout: float = 15) -> bytes:
         """JPEG，走 XCTest 的截圖（串流模式）。先丟掉 skip 張，避免拿到點擊前的舊畫面。"""
@@ -133,22 +153,16 @@ class TouchSynthesis:
             raise ValueError("skip must be a nonnegative integer")
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("timeout must be finite and positive")
-        with self._lock:
-            deadline = time.monotonic() + timeout
-            try:
-                self._call("startStream", {"quality": quality}, deadline)
-                seen = 0
-                while True:
-                    data = self._recv_frame(deadline)
-                    if data[:1] == b"\xff":
-                        seen += 1
-                        if seen > skip:
-                            self._call("stopStream", {}, deadline)
-                            return data
-            except BaseException:
-                # Closing also stops a stream when its stop acknowledgement times out.
-                self.close()
-                raise
+        with self._transaction(timeout) as deadline:
+            self._call("startStream", {"quality": quality}, deadline)
+            seen = 0
+            while True:
+                data = self._recv_frame(deadline)
+                if data[:1] == b"\xff":
+                    seen += 1
+                    if seen > skip:
+                        self._call("stopStream", {}, deadline)
+                        return data
 
 
 if __name__ == "__main__":
