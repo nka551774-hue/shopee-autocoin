@@ -116,7 +116,7 @@ class ZXTouch:
                         raise ZXConnectionError("ZXTouch 回應超過大小限制")
                     frame = bytes(self._buffer[:end])
                     del self._buffer[:end + 2]
-                    return frame.decode("utf-8", "replace")
+                    return frame.decode("utf-8")
                 if len(self._buffer) > self.MAX_RESPONSE + 1:
                     raise ZXConnectionError("ZXTouch 回應超過大小限制")
                 remaining = deadline - time.monotonic()
@@ -127,6 +127,10 @@ class ZXTouch:
                 if not chunk:
                     raise ZXConnectionError("連線被關閉")
                 self._buffer.extend(chunk)
+        except UnicodeError as exc:
+            self.close()
+            self._buffer.clear()
+            raise ZXConnectionError("ZXTouch 回應不是有效的 UTF-8") from exc
         except OSError:
             self.close()
             self._buffer.clear()
@@ -238,15 +242,17 @@ class ZXTouch:
             if not item:
                 continue
             parts = item.rsplit(",,", 4)
-            if len(parts) < 5:
-                continue
             try:
+                if len(parts) != 5:
+                    raise ValueError("missing OCR geometry")
                 values = [float(value) for value in parts[1:]]
                 if not all(math.isfinite(value) and value >= 0 for value in values):
-                    continue
+                    raise ValueError("invalid OCR geometry")
                 lines.append(dict(zip(("text", "x", "y", "width", "height"), [parts[0], *values])))
-            except ValueError:
-                continue
+            except ValueError as exc:
+                self.close()
+                self._buffer.clear()
+                raise ZXConnectionError("OCR 回應不完整，無法安全判讀畫面") from exc
         return lines, f
 
     # ---------------- 其他 ----------------

@@ -486,6 +486,7 @@ class Bot(
 
     /** 按「直播間蝦幣」的領取，確認有成功。 */
     private fun claim(r: Room) {
+        if (day.coinLimitHit) return
         val key = r.key
         val before = r.coin.coin ?: 0.0
         val button = r.coin.button ?: return
@@ -538,6 +539,7 @@ class Bot(
 
     /** 轉這間的幸運轉盤。看到結果（這次轉的或之前轉過的）就回傳 true。 */
     private fun playWheel(r: Room): Boolean {
+        if (day.wheelDone) return false
         val key = r.key
         day.room(key).wheel = true
         store.save()

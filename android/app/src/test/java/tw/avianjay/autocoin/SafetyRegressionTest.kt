@@ -127,6 +127,40 @@ class SafetyRegressionTest {
         assertThrows(StopBot::class.java) { store.save() }
     }
 
+    @Test fun persistedCountersEnforceDailyLimitsWithoutAProviderNotice() {
+        val ctx = MemoryContext()
+        val store = Store(ctx)
+        store.day.apply { coinClaims = 100; wheelSpins = 10 }
+        store.save()
+        val restored = Store(ctx)
+        assertTrue(restored.day.coinLimitHit)
+        assertTrue(restored.day.wheelDone)
+    }
+
+    @Test fun exhaustedDailyCoinQuotaBlocksEvenAVisibleClaimButton() {
+        val ctx = MemoryContext()
+        val store = Store(ctx)
+        store.day.coinClaims = 100
+        val phone = FakePhone()
+        val task = Task(true, 0.25, "領取", Pt(100, 200))
+        val room = Room("room", "", Task(), task, "", null, emptyMap(), "", null, null, null)
+        invoke(Bot(phone, store, Settings(ctx)) {}, "claim", room)
+        assertEquals(0, phone.taps)
+        assertEquals(100, store.day.coinClaims)
+    }
+
+    @Test fun exhaustedDailyWheelQuotaCannotOpenAnotherWheel() {
+        val ctx = MemoryContext()
+        val store = Store(ctx)
+        store.day.wheelSpins = 10
+        val phone = FakePhone()
+        val room = Room("room", "", Task(), Task(), "參加", Pt(100, 200), emptyMap(), "", null, null, null)
+        val bot = Bot(phone, store, Settings(ctx), sleepFor = { throw AssertionError("wheel must not be opened") }) {}
+        assertEquals(false, invoke(bot, "playWheel", room))
+        assertEquals(0, phone.taps)
+        assertFalse(store.day.room("room").wheel)
+    }
+
     @Test fun invalidStoredCountersAndAmountsAreRejected() {
         assertThrows(IllegalArgumentException::class.java) {
             Day.fromJson(JSONObject("""{"date":"2026-10-25","withdrawals":-1}"""))

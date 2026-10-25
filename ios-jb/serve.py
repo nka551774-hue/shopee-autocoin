@@ -36,6 +36,10 @@ from urllib.parse import parse_qs, urlencode
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
+sys.path.insert(0, str(ROOT))
+
+from autocoin.state import StateError, Store  # noqa: E402
+
 LOGS = ROOT / "logs"
 STOP_FILE = LOGS / "bot.stop"
 CONSOLE_LOG = LOGS / "bot-console.log"
@@ -106,7 +110,14 @@ def start_bot_now() -> str:
         if _stop_wanted:  # 還在 2 秒的啟動空檔就被按停止
             return "已取消（收到停止）"
         LOGS.mkdir(parents=True, exist_ok=True)
-        STOP_FILE.unlink(missing_ok=True)
+        try:
+            # A detached bot can outlive a crashed/restarted controller. Its
+            # process handle is lost, but the shared state lock still proves
+            # ownership; never erase the stop request while it is running.
+            with Store(ROOT / "state-ios.json").exclusive():
+                STOP_FILE.unlink(missing_ok=True)
+        except StateError as exc:
+            return f"尚未啟動：{exc}"
         _proc = subprocess.Popen(
             [sys.executable, "-u", str(HERE / "bot.py"), "run", "--stop-file", str(STOP_FILE)],
             cwd=str(HERE), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,

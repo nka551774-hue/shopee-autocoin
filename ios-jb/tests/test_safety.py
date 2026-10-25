@@ -14,6 +14,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -28,7 +29,8 @@ import screens
 import serve
 import zxtouch
 from autocoin.config import Config
-from autocoin.state import StateError, Store
+from autocoin import state as state_module
+from autocoin.state import StateError, Store, TAIPEI
 
 
 class TriggerTests(unittest.TestCase):
@@ -125,6 +127,52 @@ class TriggerTests(unittest.TestCase):
 
 
 class ProcessTests(unittest.TestCase):
+    def test_idle_controller_clears_old_stop_and_releases_state_lock_before_spawn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stop = root / "bot.stop"
+            stop.touch()
+
+            def spawn(*args, **kwargs):
+                self.assertFalse(stop.exists())
+                with Store(root / "state-ios.json").exclusive():
+                    return SimpleNamespace(poll=lambda: None)
+
+            with (patch.multiple(serve, ROOT=root, LOGS=root, STOP_FILE=stop,
+                                 _proc=None, _starting=False, _stop_wanted=False),
+                  patch.object(serve.subprocess, "Popen", side_effect=spawn) as child,
+                  patch.object(serve.threading, "Thread")):
+                self.assertEqual(serve.start_bot_now(), "開始了")
+                child.assert_called_once()
+
+    def test_restarted_controller_cannot_clear_an_active_owners_stop_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stop = root / "bot.stop"
+            stop.touch()
+            script = """
+import sys
+from autocoin.state import Store
+with Store(sys.argv[1]).exclusive():
+    print('locked', flush=True)
+    sys.stdin.read()
+"""
+            owner = subprocess.Popen(
+                [sys.executable, "-c", script, str(root / "state-ios.json")],
+                cwd=HERE.parent, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual(owner.stdout.readline().strip(), "locked")
+                with (patch.multiple(serve, ROOT=root, LOGS=root, STOP_FILE=stop,
+                                     _proc=None, _starting=False, _stop_wanted=False),
+                      patch.object(serve.subprocess, "Popen") as spawn,
+                      patch.object(serve.threading, "Thread")):
+                    serve.start_bot_now()
+                    self.assertTrue(stop.exists(), "an orphan still owns the state; its stop request must survive")
+                    spawn.assert_not_called()
+            finally:
+                owner.communicate(timeout=5)
+
     def test_parallel_starts_and_stop_during_startup_create_no_child(self):
         entered, release, cancelled = threading.Event(), threading.Event(), threading.Event()
 
@@ -285,6 +333,22 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             zx.swipe(1, 1, 2, 2, steps=0)
 
+    def test_invalid_utf8_cannot_become_trusted_ocr_text(self):
+        zx, peer = self.connect()
+        peer.sendall(b"0;;risk\xffwarning,,10,,20,,30,,40\r\n")
+        with self.assertRaises(zxtouch.ZXConnectionError):
+            zx.ocr((0, 0, 0, 0))
+        self.assertEqual(zx.s.fileno(), -1)
+
+    def test_malformed_ocr_record_cannot_return_a_partial_screen(self):
+        for broken in ("warning", "warning,,NaN,,20,,30,,40", "warning,,10,,20,,-1,,40"):
+            with self.subTest(broken=broken):
+                zx, peer = self.connect()
+                peer.sendall(f"0;;Claim,,10,,20,,30,,40;;{broken}\r\n".encode())
+                with self.assertRaises(zxtouch.ZXConnectionError):
+                    zx.ocr((0, 0, 0, 0))
+                self.assertEqual(zx.s.fileno(), -1)
+
 
 class BotTests(unittest.TestCase):
     def setUp(self):
@@ -299,6 +363,51 @@ class BotTests(unittest.TestCase):
         self.shot.find.return_value = None
         self.shot.lines = []
         self.phone.shot.return_value = self.shot
+
+    def test_restarted_countdown_is_not_recorded_as_success(self):
+        before = screens.Room(coin=screens.Task(present=True, claimable=True, button=(1, 2)))
+        after = screens.Room(coin=screens.Task(present=True, state="05:00"))
+        self.bot.pause = Mock()
+        self.bot.capture = Mock()
+        with (patch.object(bot, "read_room", return_value=after),
+              patch.object(bot.time, "monotonic", side_effect=[0, 1, 7])):
+            with self.assertRaises(bot.StopBot):
+                self.bot.claim(before, "room")
+        self.assertEqual(self.store.day.coin_claims, 0)
+        self.assertFalse(self.store.path.exists())
+
+    def test_daily_coin_limit_prevents_another_touch(self):
+        self.store.day.coin_claims = 100
+        before = screens.Room(coin=screens.Task(present=True, claimable=True, button=(1, 2)))
+        self.bot.pause = Mock()
+        with patch.object(bot, "read_room", return_value=screens.Room(claimed="成功領取0.25蝦幣")):
+            self.bot.claim(before, "room")
+        self.phone.tap.assert_not_called()
+        self.assertEqual(self.store.day.coin_claims, 100)
+
+    def test_final_panel_crossing_midnight_resumes_new_day(self):
+        now = [datetime(2026, 10, 25, 23, 59, tzinfo=TAIPEI)]
+        with (patch.object(state_module, "reward_now", side_effect=lambda: now[0]),
+              patch.object(bot, "reward_now", side_effect=lambda: now[0])):
+            self.bot.store = Store(Path(self.tmp.name) / "midnight.json")
+            self.bot.go_room = Mock()
+            self.bot.panel_tasks = Mock(side_effect=lambda **_: now.__setitem__(0, now[0] + timedelta(minutes=2)))
+            self.bot.pause = Mock(side_effect=AssertionError("must not sleep through the new reward day"))
+            self.bot.rest_until_tomorrow()
+            self.bot.pause.assert_not_called()
+            self.assertFalse(self.bot.day.final_panel)
+
+    def test_panel_screen_change_prevents_claim_touch(self):
+        self.bot.look = Mock(return_value=(screens.Screen.PANEL, self.shot))
+        self.bot.pause = Mock()
+        self.bot.capture = Mock()
+        self.bot.capture_once = Mock()
+        self.bot.back_to_room = Mock()
+        with (patch.object(bot, "detect", return_value=screens.Screen.UNKNOWN),
+              patch.object(bot, "read_panel", return_value=screens.Panel(claim=(1, 2)))):
+            with self.assertRaises(bot.StopBot):
+                self.bot.panel_tasks()
+        self.phone.tap.assert_not_called()
 
     def test_cancel_interrupts_long_sleep_and_prevents_cleanup_actions(self):
         stop = Path(self.tmp.name) / "stop"
@@ -366,6 +475,7 @@ class BotTests(unittest.TestCase):
         self.phone.tap.assert_not_called()
 
     def test_failed_watch_claim_is_not_counted(self):
+        self.shot.lines = [screens.Line("待提領蝦幣數", 100, 300)]
         self.bot.pause = Mock()
         self.bot.capture_once = Mock()
         self.bot.capture = Mock()
@@ -378,6 +488,7 @@ class BotTests(unittest.TestCase):
         self.assertEqual(self.store.day.watch_total, 0)
 
     def test_confirmed_watch_claim_counts_actual_balance_change(self):
+        self.shot.lines = [screens.Line("待提領蝦幣數", 100, 300)]
         self.bot.pause = Mock()
         self.bot.capture_once = Mock()
         self.bot.look = Mock(return_value=(screens.Screen.PANEL, self.shot))
@@ -389,6 +500,7 @@ class BotTests(unittest.TestCase):
         self.assertEqual(self.store.day.watch_total, 0.21)
 
     def test_pending_withdrawal_still_allows_confirmed_watch_rewards(self):
+        self.shot.lines = [screens.Line("待提領蝦幣數", 100, 300)]
         self.cfg.withdraw = True
         self.store.day.withdrawal_pending = True
         self.bot.pause = Mock()
@@ -454,6 +566,31 @@ class BotTests(unittest.TestCase):
             self.bot.withdraw(screens.Panel(withdraw=(5, 6)))
         self.assertEqual([c.args for c in self.phone.tap.call_args_list], [(5, 6), (1, 2)])
         self.assertFalse(self.store.day.withdrawal_pending)
+
+    def test_changed_eligibility_after_amount_selection_prevents_submit(self):
+        for change in ("disabled", "limit", "option"):
+            with self.subTest(change=change):
+                self.phone.tap.reset_mock()
+                self.store.day.withdrawals = 0
+                self.store.day.withdrawal_pending = False
+                page, _ = self.prepare_withdraw()
+                selected = screens.WithdrawPage(pending=10, options=page.options, submit=page.submit)
+
+                def tap(x, y):
+                    if (x, y) == (1, 2):
+                        if change == "disabled":
+                            self.cfg.withdraw = False
+                        elif change == "limit":
+                            self.store.day.withdrawals = 3
+                        else:
+                            selected.options = []
+
+                self.phone.tap.side_effect = tap
+                with (patch.object(bot, "read_withdraw", side_effect=[page] + [selected] * 11),
+                      patch.object(bot, "read_panel", return_value=screens.Panel(withdraw=(5, 6)))):
+                    self.bot.withdraw(screens.Panel(withdraw=(5, 6)))
+                self.assertEqual([c.args for c in self.phone.tap.call_args_list], [(5, 6), (1, 2)])
+                self.assertFalse(self.store.day.withdrawal_pending)
 
     def test_generic_confirmation_is_never_tapped(self):
         page, shot = self.prepare_withdraw()

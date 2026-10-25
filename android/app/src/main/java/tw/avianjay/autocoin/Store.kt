@@ -178,6 +178,8 @@ class Store(ctx: Context, private val dateProvider: () -> LocalDate = { LocalDat
                 current = nextDay(current, date)
                 save()
             }
+            if (current.coinClaims >= 100) current.coinLimitHit = true
+            if (current.wheelSpins >= 10) current.wheelDone = true
             return current
         }
 

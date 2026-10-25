@@ -2,6 +2,38 @@
 
 日期：2026-10-25（Asia/Taipei）。基準版本：`f421c31`。範圍包含 `autocoin/`、`android/`、`ios/`、原有但尚未追蹤的 `ios-jb/` 與 `ios-app/`，以及 GitHub Actions。
 
+## 第二輪故障路徑複查（2026-10-25，基準 `bec2151`）
+
+本輪追查停止／重啟、跨程序所有權、TCP 回應完整性、持久化配額與排程邊界。以下修復先新增回歸並觀察原碼失敗，再修改正式路徑；新增 12 個測試，其中 11 個為失敗重現（含參數化共 15 個失敗案例），另 1 個驗證正常啟動仍可清除舊停止旗標，且啟動子程序前已釋放狀態鎖。
+
+| 可重現故障 | 根因與修復 |
+|---|---|
+| 越獄版沒有成功提示，倒數回到 `05:00` 仍增加領取次數 | 該入口仍保留以倒數重置推定成功的舊分支。現在結果不明即停止，保留畫面、不增加成功統計；已達每日 100 次時不再觸控。 |
+| 越獄版收尾從 23:59 跨到 00:01 後再睡一天 | 原來用收尾完成後的日期再加一天。現在以已完成的獎勵日計算醒來時間，收尾跨日即返回新一天的流程。 |
+| 面板載入期間已離開面板，或選額後關閉提領／額度用完／面額消失，仍繼續點擊 | 越獄版現在重新辨識等待後的面板；提領送出前重新核對設定、未確認交易、每日額度與可選面額，失配時不寫入新 journal 或送出提領。 |
+| ZXTouch 回應含非法 UTF-8 或部分 OCR 行缺少／損壞座標，仍返回其餘文字 | 原來使用替代字元解碼並丟棄壞行，可能同時保留可按按鈕、遺失警示文字。現在拒絕整個回應並關閉連線，後續讀取由既有重連路徑重新取得完整畫面。正常黏包、分段與有效 OCR 路徑仍通過測試。 |
+| 控制器重啟後不認得仍在執行的 detached bot，按開始會刪掉該 bot 的停止要求 | 使用真實子程序持有共用狀態鎖重現。控制器清除停止檔前先取得同一狀態鎖；已有 owner 時保留停止檔並拒絕另開子程序。此鎖仍以該統計檔為範圍。 |
+| Android 已記錄 100 次領幣或 10 次轉盤，但沒有收到平台上限提示時仍操作 | 讀取當日狀態時由已保存的計數推導上限旗標，並在領取與開轉盤入口再次檢查；從磁碟資料恢復及目前執行中的計數皆受限。 |
+
+修改範圍為 `ios-jb/bot.py`、`ios-jb/serve.py`、`ios-jb/zxtouch.py` 與其測試，以及 Android 的 `Bot.kt`、`Store.kt` 與 JVM 測試。既有三個越獄版觀看任務 fixture 補上真實面板標籤，讓正式畫面辨識可確認所在頁面；原成功金額、未確認提領與不誤記帳的斷言仍保留。
+
+本輪重新執行結果：
+
+| 命令／檢查 | 結果 |
+|---|---|
+| `.venv/Scripts/python.exe -m pytest -q` | 77 通過 |
+| `.venv/Scripts/python.exe -m unittest discover -s ios/tests -q` | 42 通過 |
+| `.venv/Scripts/python.exe -m unittest discover -s ios-jb/tests -q` | 50 通過 |
+| `.venv/Scripts/python.exe ios-jb/selftest.py` | 36 項 loopback 檢查通過 |
+| `gradlew.bat --no-daemon --console=plain testDebugUnitTest lintDebug assembleDebug` | JVM 33 通過，0 failures／errors／skipped；Lint 0 issue；debug APK 建置成功 |
+| `python -m ruff check autocoin ios ios-jb tests tools` | 通過 |
+| `python -m pip check`、`python -m pip_audit --progress-spinner off` | 相依性一致；當次資料庫未發現已知漏洞 |
+| `git diff --check` | 通過 |
+
+共 **202 項回歸測試**，另有 **36 項 loopback 檢查**。Android 使用 JDK 21.0.10、Android 36 SDK 與 Gradle 9.7.1，在既有 ASCII 暫存副本重新同步並建置；22 個 Git 追蹤 Android 檔案與工作目錄 SHA-256 全數一致。APK SHA-256：`5B0BBBE46BB22F6ACA3FE9371EC2B638581F486B9C78DF0CF0158F8259D17EA7`。本輪建置仍顯示 Gradle 10 相容性棄用警告。
+
+已複查的停止 worker 所有權、捕捉原程序的終止行為、損壞狀態不清零、唯讀查詢不覆寫狀態、整體 socket 讀取期限與明確拒絕優先等既有保護，仍由上述回歸涵蓋；沒有為它們額外重排程式。Android 真實服務重建／手勢 callback、外部裝置行為與新版蝦皮畫面仍需實機驗證。本輪未連接真實手機、未領取或提領、未安裝 APK，也未重新執行效能 benchmark；下方先前效能數字保留為歷史證據。
+
 ## 接手複查（2026-10-25，基準 `9d2d9db`）
 
 本輪接續未提交的 Python／iOS 修正，並對照原生 Android 的同一套流程。專案由下列獨立入口組成；共用設定與統計不代表各版本的裝置操作實作相同。

@@ -483,6 +483,8 @@ class Bot:
 
     def claim(self, r: Room, key: str):
         """按「直播間蝦幣」的領取，確認有成功。"""
+        if self.day.coin_limit_hit:
+            return
         self.phone.tap(*r.coin.button)
         amount = None
         deadline = time.monotonic() + 6
@@ -502,16 +504,8 @@ class Bot:
                 break
             self.pause(0.35)
         if amount is None:
-            # 沒看到成功提示：倒數已經重新開始的話也算成功（金額不明）
-            after = read_room(s).coin if s else None
-            if after and (after.seconds or 0) > 120:
-                amount = 0.0
-                log.warning("沒看到成功提示，但倒數重新開始了，當作有領到")
-            else:
-                log.warning("直播間蝦幣按了沒反應（現在顯示：%s）",
-                            (after.state if after and after.present else "不見了") or "?")
-                self.capture("claim-unknown", s)
-                return
+            self.capture("claim-unknown", s)
+            raise StopBot("直播間領取結果不明，停止以避免重複操作；未計入成功")
         day = self.day
         room = day.room(key)
         room["claims"] += 1
@@ -572,6 +566,8 @@ class Bot:
         self.pause(1.5)  # 等畫面載完
         s = self.phone.shot()
         self.check_messages(s)
+        if detect(s) is not Screen.PANEL:
+            raise StopBot("任務面板已改變，停止使用舊畫面")
         p = read_panel(s)
         if p.claim:
             before = p.pending
@@ -691,6 +687,12 @@ class Bot:
             self.capture("withdraw-balance-unknown", s)
             return
         pending = w.pending
+        day = self.day
+        if (not self.cfg.withdraw or day.withdrawal_pending
+                or day.withdrawals >= self.cfg.withdraw_daily_limit
+                or not any(value == amount for value, _ in w.options)):
+            log.warning("提領設定、額度或可選面額已改變，取消本次提領")
+            return
         if not w.submit:
             log.warning("找不到「立即提領」")
             self.phone.tap(*BACK)
@@ -815,13 +817,17 @@ class Bot:
 
     def rest_until_tomorrow(self):
         day = self.day
+        completed_date = day.date
         if not day.final_panel:
             self.go_room()
             self.panel_tasks(final=True)
+            day = self.day
+            if day.date != completed_date:
+                return
             day.final_panel = True
             self.store.save()
         log.info("今天能領的都領完了，休息到明天：%s", self.store.summary())
-        wake = (reward_now() + timedelta(days=1)).replace(hour=0, minute=3, second=0, microsecond=0)
+        wake = datetime.fromisoformat(f"{completed_date}T00:03:00+08:00") + timedelta(days=1)
         while reward_now() < wake and not self.time_up():
             self.pause(min(300, max(1, (wake - reward_now()).total_seconds())))
 
