@@ -841,9 +841,15 @@ class Bot:
                 except Exception:
                     log.exception("出錯了，10 秒後繼續")
                     self.pause(10)
-        except (StopBot, UnsafeAction, StateError) as e:
+        except StopBot as e:
+            # A deadline can expire inside a wait.  That is a successful timed
+            # run; every other StopBot must reach the CLI so it returns nonzero.
+            if not self.time_up():
+                log.error("停止：%s", e)
+                raise
+        except (UnsafeAction, StateError) as e:
             log.error("停止：%s", e)
-            return
+            raise
         log.info("結束：%s", self.store.summary())
 
     def cycle(self):

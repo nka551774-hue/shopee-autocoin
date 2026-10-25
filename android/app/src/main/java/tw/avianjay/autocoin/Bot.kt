@@ -48,6 +48,15 @@ private val REASONS = mapOf(
 )
 // 因為這些原因離開的直播間，今天就不再進去
 private val DONE_REASONS = setOf("no_coins", "room_done", "timeout", "watched", "wheel_checked")
+
+/** Popup close buttons are scaled independently on each display axis. */
+internal fun popupCloseSize(width: Int, height: Int, screenWidth: Int, screenHeight: Int): Boolean {
+    val minWidth = 60 * screenWidth / 1080
+    val maxWidth = 150 * screenWidth / 1080
+    val minHeight = 60 * screenHeight / 2400
+    val maxHeight = 150 * screenHeight / 2400
+    return width in minWidth..maxWidth && height in minHeight..maxHeight
+}
 private val STAMP = DateTimeFormatter.ofPattern("MMdd-HHmmss")
 private val PENDING_AMOUNT = Regex("""待提領蝦幣數[:：]\s*(\d+(?:\.\d+)?)\s*""")
 
@@ -277,7 +286,8 @@ class Bot(
         val bare = s.nodes.filter { it.clickable && it.rid.isEmpty() && it.text.isEmpty() && it.desc.isEmpty() }
         val big = bare.firstOrNull { it.width > x(600) && it.height > y(700) } ?: return false
         val close = bare.firstOrNull {
-            it.width in x(60)..x(150) && it.height in x(60)..x(150) && it.bounds.top >= big.bounds.bottom - 30
+            popupCloseSize(it.width, it.height, phone.width, phone.height) &&
+                it.bounds.top >= big.bounds.bottom - 30
         } ?: return false
         AppLog.i("關掉廣告彈窗")
         phone.tap(close.center)

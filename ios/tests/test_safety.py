@@ -239,6 +239,15 @@ class BotSafetyTests(unittest.TestCase):
             self.bot.look()
         self.phone.tap.assert_not_called()
 
+    def test_capture_cleanup_failure_does_not_mask_risk_stop(self):
+        self.bot.capture = bot.Bot.capture.__get__(self.bot)
+        for index in range(301):
+            (self.bot.captures / f"old-{index:03}.jpg").write_bytes(b"offline")
+        risky = FakeShot(["偵測到風險活動"])
+        with patch.object(Path, "unlink", side_effect=PermissionError("capture is locked")):
+            with self.assertRaises(bot.StopBot):
+                self.bot.check_risk(risky)
+
     def test_unknown_screen_never_uses_blind_back_coordinates(self):
         self.bot.look = Mock(return_value=(screens.Screen.UNKNOWN, self.empty))
         self.assertFalse(self.bot.back_to_room(screens.Screen.UNKNOWN, self.empty))
@@ -443,6 +452,12 @@ class BotSafetyTests(unittest.TestCase):
             self.bot.pause.assert_not_called()
             self.assertFalse(self.bot.day.final_panel)
 
+    def test_fatal_run_error_reaches_cli_boundary(self):
+        self.bot.cycle = Mock(side_effect=bot.StopBot("risk warning"))
+        with self.assertRaisesRegex(bot.StopBot, "risk warning"):
+            self.bot.run()
+        self.bot.cycle.assert_called_once()
+
 
 class ScreenTests(unittest.TestCase):
     def test_chat_or_embedded_labels_cannot_trigger_panel_navigation(self):
@@ -533,6 +548,20 @@ class HelperLockTests(unittest.TestCase):
                         module.main()
                 connect.assert_not_called()
                 self.assertEqual(state.path.read_bytes(), original)
+
+
+class CliExitTests(unittest.TestCase):
+    def test_fatal_run_stop_returns_nonzero(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(bot, "ROOT", Path(temp)), \
+                patch.object(bot, "_get_engine"), \
+                patch.object(bot, "setup_logging"), \
+                patch.object(bot, "Phone") as phone_type, \
+                patch.object(bot, "Bot") as bot_type, \
+                patch.object(sys, "argv", ["bot.py", "run"]):
+            bot_type.return_value.run.side_effect = bot.StopBot("risk warning")
+            self.assertEqual(bot.main(), 1)
+            phone_type.return_value.close.assert_called_once()
 
 
 if __name__ == "__main__":

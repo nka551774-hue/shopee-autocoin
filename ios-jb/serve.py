@@ -274,8 +274,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.path not in ("/start", "/stop"):
             self._send("找不到頁面", 404)
             return
+        lengths = self.headers.get_all("Content-Length", [])
+        if len(lengths) != 1:
+            self._send("Content-Length 數量不正確", 400)
+            return
         try:
-            size = int(self.headers.get("Content-Length", ""))
+            size = int(lengths[0])
         except ValueError:
             self._send("需要 Content-Length", 411)
             return

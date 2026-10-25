@@ -131,6 +131,15 @@ class TriggerTests(unittest.TestCase):
         self.assertIn(b"400", self.raw_request(request.encode("ascii")).split(b"\r\n", 1)[0])
         self.mocks[1].assert_not_called()
 
+    def test_duplicate_content_length_cannot_trigger_actions(self):
+        port = self.server.server_port
+        body = urlencode({"token": serve._csrf_token})
+        request = (f"POST /start HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n"
+                   "Content-Type: application/x-www-form-urlencoded\r\n"
+                   f"Content-Length: {len(body)}\r\nContent-Length: 0\r\n\r\n{body}")
+        self.assertIn(b"400", self.raw_request(request.encode("ascii")).split(b"\r\n", 1)[0])
+        self.mocks[1].assert_not_called()
+
     def test_logs_cannot_execute_as_html(self):
         _, headers, body = self.request("GET", "/status")
         self.assertEqual(headers["Content-Type"], "text/plain; charset=utf-8")
@@ -406,6 +415,16 @@ class BotTests(unittest.TestCase):
         with patch.object(bot, "detect", return_value=screens.Screen.UNKNOWN):
             self.assertEqual(self.bot.look()[0], screens.Screen.UNKNOWN)
         self.phone.tap.assert_not_called()
+
+    def test_capture_cleanup_failure_does_not_mask_risk_stop(self):
+        for index in range(301):
+            (self.bot.captures / f"old-{index:03}.txt").write_text("offline", encoding="utf-8")
+        risky = Mock()
+        risky.texts.return_value = ["偵測到風險活動"]
+        risky.lines = []
+        with patch.object(Path, "unlink", side_effect=PermissionError("capture is locked")):
+            with self.assertRaises(bot.StopBot):
+                self.bot._check_risk(risky)
 
     def test_old_reward_notice_cannot_confirm_a_new_watch_claim(self):
         self.shot.lines = [screens.Line("待提領蝦幣數", 100, 300)]
@@ -722,6 +741,12 @@ class BotTests(unittest.TestCase):
     def test_state_failure_is_not_retried(self):
         self.bot.cycle = Mock(side_effect=StateError("disk full"))
         with self.assertRaises(StateError):
+            self.bot.run()
+        self.bot.cycle.assert_called_once()
+
+    def test_fatal_run_stop_reaches_cli_boundary(self):
+        self.bot.cycle = Mock(side_effect=bot.StopBot("risk warning"))
+        with self.assertRaisesRegex(bot.StopBot, "risk warning"):
             self.bot.run()
         self.bot.cycle.assert_called_once()
 

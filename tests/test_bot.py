@@ -8,6 +8,7 @@ from autocoin import bot as bot_module
 from autocoin import state as state_module
 from autocoin.bot import Bot, StopBot
 from autocoin.config import Config
+from autocoin.device import UnsafeAction
 from autocoin.screens import read_room
 from autocoin.state import StateError, Store, TAIPEI
 from autocoin.ui import PKG, Snapshot
@@ -236,6 +237,20 @@ def test_hours_stops_inside_locked_wait_without_final_withdrawal(make_bot):
     assert b.time_up()
     assert not b.dev.actions
     b.panel_tasks.assert_not_called()
+
+
+@pytest.mark.parametrize("error", [
+    StopBot("risk warning"),
+    UnsafeAction("foreground changed"),
+    StateError("disk full"),
+])
+def test_fatal_run_error_reaches_cli_boundary(make_bot, error):
+    b = make_bot([room()])
+    b.ensure_app = Mock()
+    b.cycle = Mock(side_effect=error)
+    with pytest.raises(type(error), match=str(error)):
+        b.run()
+    b.cycle.assert_called_once()
 
 
 @pytest.mark.parametrize("hours", [0, -1, float("nan"), float("inf")])

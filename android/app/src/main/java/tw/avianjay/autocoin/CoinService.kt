@@ -18,7 +18,10 @@ import android.widget.TextView
 import java.io.File
 import java.lang.ref.WeakReference
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.FutureTask
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 無障礙服務：讀蝦皮的畫面、用手勢點座標（跟 MacroDroid 按座標一樣），
@@ -238,44 +241,75 @@ class CoinService : AccessibilityService(), Phone {
 
     private fun gesture(path: Path, ms: Long) {
         val done = CountDownLatch(1)
-        var completed = false
+        val completed = AtomicBoolean(false)
         val stroke = GestureDescription.StrokeDescription(path, 0, ms)
         val callback = object : GestureResultCallback() {
             override fun onCompleted(g: GestureDescription?) {
-                completed = true
+                completed.set(true)
                 done.countDown()
             }
             override fun onCancelled(g: GestureDescription?) = done.countDown()
         }
-        val ok = synchronized(this) {
-            checkControl()
+        val ok = runActionOnMain { owner ->
+            checkControl(owner)
             dispatchGesture(GestureDescription.Builder().addStroke(stroke).build(), callback, main)
         }
-        check(ok && done.await(ms + 2000, TimeUnit.MILLISECONDS) && completed) { "手勢未完成，重新讀取畫面" }
+        check(ok) { "系統未接受手勢" }
+        if (!done.await(ms + 2000, TimeUnit.MILLISECONDS) || !completed.get()) {
+            throw StopBot("手勢結果不明，停止以避免重複操作")
+        }
         checkWorker()
         Thread.sleep(Jitter.ms(80, 0.6))
     }
 
     override fun back() {
-        synchronized(this) {
-            checkControl(allowSystem = true)
+        runActionOnMain { owner ->
+            checkControl(owner, allowSystem = true)
             check(performGlobalAction(GLOBAL_ACTION_BACK)) { "返回操作未完成" }
         }
         Thread.sleep(Jitter.ms(100, 0.6))
     }
 
     private fun checkWorker() {
-        if (stopping || Thread.currentThread().isInterrupted || worker !== Thread.currentThread()) {
+        checkWorker(Thread.currentThread())
+    }
+
+    /** Recheck the worker captured before an action was queued on the main thread. */
+    private fun checkWorker(expected: Thread) {
+        if (stopping || expected.isInterrupted || worker !== expected) {
             throw InterruptedException("自動操作已停止")
         }
     }
 
-    private fun checkControl(allowSystem: Boolean = false) {
-        checkWorker()
+    private fun checkControl(expected: Thread, allowSystem: Boolean = false) {
+        checkWorker(expected)
         check(screenOn() && !locked()) { "螢幕已鎖定，暫停操作" }
         val pkg = foreground()
         check(pkg == SHOPEE || (allowSystem && pkg in setOf("android", "com.android.intentresolver"))) {
             "前景已變成 $pkg，暫停操作"
+        }
+    }
+
+    /**
+     * Accessibility actions run on the service main thread.  The worker is
+     * checked once before queueing and again immediately before the action so
+     * a stop/restart or foreground change cannot leave a stale command queued.
+     */
+    private fun <T> runActionOnMain(action: (Thread) -> T): T {
+        val owner = Thread.currentThread()
+        checkWorker(owner)
+        val task = FutureTask {
+            checkWorker(owner)
+            action(owner)
+        }
+        if (!main.post(task)) throw InterruptedException("無障礙服務已停止")
+        try {
+            return task.get()
+        } catch (e: InterruptedException) {
+            task.cancel(false)
+            throw e
+        } catch (e: ExecutionException) {
+            throw (e.cause ?: e)
         }
     }
 
@@ -288,17 +322,20 @@ class CoinService : AccessibilityService(), Phone {
 
     override fun locked() = getSystemService(KeyguardManager::class.java).isKeyguardLocked
 
-    @Synchronized
     override fun launchShopee() {
-        checkWorker()
-        check(screenOn() && !locked()) { "螢幕已鎖定，暫停開啟 App" }
-        val pkg = foreground()
-        check(pkg.isEmpty() || pkg == SHOPEE || pkg == ownPackage || pkg == homePackage()) { "前景已變成 $pkg，暫停開啟 App" }
-        val intent = packageManager.getLaunchIntentForPackage(SHOPEE) ?: run {
-            AppLog.w("找不到蝦皮 App")
-            return
+        runActionOnMain { owner ->
+            checkWorker(owner)
+            check(screenOn() && !locked()) { "螢幕已鎖定，暫停開啟 App" }
+            val pkg = foreground()
+            check(pkg.isEmpty() || pkg == SHOPEE || pkg == ownPackage || pkg == homePackage()) {
+                "前景已變成 $pkg，暫停開啟 App"
+            }
+            val intent = packageManager.getLaunchIntentForPackage(SHOPEE) ?: run {
+                AppLog.w("找不到蝦皮 App")
+                return@runActionOnMain
+            }
+            startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         }
-        startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
     }
 
     override fun homePackage(): String =

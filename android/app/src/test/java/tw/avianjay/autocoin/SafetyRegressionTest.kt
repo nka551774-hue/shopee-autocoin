@@ -302,6 +302,21 @@ class SafetyRegressionTest {
         assertThrows(InterruptedException::class.java) { invoke(service, "checkWorker") }
     }
 
+    @Test fun queuedActionRechecksTheCapturedWorkerGeneration() {
+        val service = CoinService()
+        val workerField = CoinService::class.java.getDeclaredField("worker").apply { isAccessible = true }
+        val captured = Thread.currentThread()
+        workerField.set(service, captured)
+        invoke(service, "checkWorker", captured)
+        workerField.set(service, Thread("replacement-worker"))
+        assertThrows(InterruptedException::class.java) { invoke(service, "checkWorker", captured) }
+    }
+
+    @Test fun popupCloseHeightUsesVerticalScale() {
+        assertTrue(popupCloseSize(width = 100, height = 200, screenWidth = 1080, screenHeight = 4800))
+        assertFalse(popupCloseSize(width = 100, height = 310, screenWidth = 1080, screenHeight = 4800))
+    }
+
     @Test fun foreignForegroundOverridesShopeeLookingNodes() {
         val snap = Snap(listOf(node("tv_anchor_name", "room", 0)), "com.other.app", "")
         assertEquals(Screen.OTHER_APP, detect(snap))

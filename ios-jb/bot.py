@@ -280,8 +280,18 @@ class Bot:
                 "\n".join(f"({ln.x:4.0f},{ln.y:4.0f}) {ln.text}" for ln in s.lines), encoding="utf-8")
         except Exception:
             log.debug("存畫面失敗", exc_info=True)
-        for old in sorted(self.captures.glob("*.txt"))[:-300]:
-            old.unlink(missing_ok=True)
+        try:
+            old_captures = sorted(self.captures.glob("*.txt"))[:-300]
+        except OSError:
+            log.debug("列出舊畫面失敗", exc_info=True)
+            old_captures = []
+        for old in old_captures:
+            try:
+                old.unlink(missing_ok=True)
+            except OSError:
+                # Diagnostics are best-effort.  A cleanup failure must not
+                # replace the safety exception that caused this capture.
+                log.debug("清理舊畫面失敗", exc_info=True)
         log.debug("已存畫面 %s", base.name)
 
     def capture_once(self, tag: str, s: Shot | None = None):
@@ -768,9 +778,10 @@ class Bot:
                     log.exception("出錯了，10 秒後繼續")
                     self.pause(10)
         except StopBot as e:
-            log.error("停止：%s", e)
-            self.phone.toast(f"蝦皮自動領蝦幣：停止（{e}）", TOAST_ERROR)
-            return
+            if not self.time_up():
+                log.error("停止：%s", e)
+                self.phone.toast(f"蝦皮自動領蝦幣：停止（{e}）", TOAST_ERROR)
+                raise
         log.info("結束：%s", self.store.summary())
         self.phone.toast(f"蝦皮自動領蝦幣：結束｜{self.store.summary()}", TOAST_SUCCESS)
 
